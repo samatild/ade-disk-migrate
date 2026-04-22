@@ -1170,6 +1170,28 @@ fixup_target() {
         warn "fstab not found on target"
     fi
 
+    # --- Fix EFI grub.cfg boot UUID reference ---
+    info "Updating EFI GRUB config..."
+    local efi_grub_cfg="$tgt_root/boot/efi/EFI/redhat/grub.cfg"
+    if [[ ! -f "$efi_grub_cfg" ]]; then
+        # Try Ubuntu/generic path
+        efi_grub_cfg="$tgt_root/boot/efi/EFI/ubuntu/grub.cfg"
+    fi
+    if [[ -f "$efi_grub_cfg" ]]; then
+        local src_boot_uuid tgt_boot_uuid_efi
+        src_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+        tgt_boot_uuid_efi=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
+        if [[ -n "$src_boot_uuid" ]] && [[ -n "$tgt_boot_uuid_efi" ]] && [[ "$src_boot_uuid" != "$tgt_boot_uuid_efi" ]]; then
+            cp "$efi_grub_cfg" "${efi_grub_cfg}.bak.${TIMESTAMP}"
+            sed -i "s/${src_boot_uuid}/${tgt_boot_uuid_efi}/g" "$efi_grub_cfg"
+            detail "EFI grub.cfg: boot UUID ${src_boot_uuid} ${ARROW} ${tgt_boot_uuid_efi}"
+        else
+            detail "EFI grub.cfg: boot UUID unchanged"
+        fi
+    else
+        warn "EFI grub.cfg not found — boot may require manual fix"
+    fi
+
     # --- Remove crypttab ---
     local crypttab_file="$tgt_root/etc/crypttab"
     if [[ -f "$crypttab_file" ]]; then
