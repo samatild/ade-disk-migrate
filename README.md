@@ -13,6 +13,21 @@ Two modes:
 - Azure account with permissions to create/delete VMs and disks
 - Source VM must be **running** (the encrypted disk must be unlocked)
 
+## Quick Start
+
+Download the orchestrator script and run it — it will download the migration script automatically:
+
+```powershell
+# Download
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/samatild/ade-disk-migrate/main/ade-deploy.ps1" -OutFile ade-deploy.ps1
+
+# Run (replace source VM in-place)
+./ade-deploy.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM"
+
+# Or clone instead (source VM untouched)
+./ade-deploy.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM" -Clone
+```
+
 ## Usage
 
 ### Automated (recommended)

@@ -304,10 +304,18 @@ try {
 
     $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
     $migrateScript = Join-Path $scriptDir 'ade-migrate.sh'
+    $migrateUrl = 'https://raw.githubusercontent.com/samatild/ade-disk-migrate/main/ade-migrate.sh'
+
     if (-not (Test-Path $migrateScript)) {
-        Write-Err "ade-migrate.sh not found at: $migrateScript"
-        Write-Err "Ensure ade-migrate.sh is in the same directory as ade-deploy.ps1"
-        exit 1
+        Write-Step "ade-migrate.sh not found locally, downloading from GitHub..."
+        try {
+            Invoke-WebRequest -Uri $migrateUrl -OutFile $migrateScript -UseBasicParsing -ErrorAction Stop
+            Write-OK "Downloaded ade-migrate.sh"
+        } catch {
+            Write-Err "Failed to download ade-migrate.sh from $migrateUrl"
+            Write-Err $_.Exception.Message
+            exit 1
+        }
     }
 
     # Upload script via base64 to avoid escaping issues
