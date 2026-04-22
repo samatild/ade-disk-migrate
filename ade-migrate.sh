@@ -1367,17 +1367,17 @@ verify_target() {
     info "Target disk final layout:"
     lsblk -o NAME,SIZE,FSTYPE,UUID "/dev/${TARGET_DISK}" 2>/dev/null | while IFS= read -r line; do
         detail "$line"
-    done
+    done || true
 
     if $USE_LVM; then
         echo ""
         info "Target LVM layout:"
         pvs --noheadings -o pv_name,vg_name,pv_size "/dev/${TARGET_DISK}"* 2>/dev/null | while IFS= read -r line; do
             detail "PV: $line"
-        done
+        done || true
         lvs --noheadings -o lv_name,lv_size "$SOURCE_VG" 2>/dev/null | while IFS= read -r line; do
             detail "LV: $line"
-        done
+        done || true
     fi
 
     echo ""
@@ -1543,12 +1543,12 @@ main() {
     # Phase 4: Fixup
     fixup_target
 
-    # Phase 5: Verify
-    verify_target
-
-    # Clear SOURCE_VG_BACKUP so cleanup doesn't rename it back
+    # Clear SOURCE_VG_BACKUP so cleanup doesn't roll back a completed migration
     # (target VG now owns the original name; source stays as rootvg_mig until disk is detached)
     SOURCE_VG_BACKUP=""
+
+    # Phase 5: Verify
+    verify_target
 
     # Done
     print_final_report
