@@ -208,20 +208,10 @@ cleanup() {
             rmdir "$mnt" 2>/dev/null || true
         fi
     done
-    # Restore source VG name if it was temporarily renamed (only on failure)
-    if [[ -n "$SOURCE_VG_BACKUP" ]] && [[ -n "$SOURCE_VG" ]]; then
-        if vgs "$SOURCE_VG_BACKUP" &>/dev/null; then
-            log "INFO" "Restoring source VG name: ${SOURCE_VG_BACKUP} -> ${SOURCE_VG}"
-            # Remove the (partially created) target VG if it took the original name
-            if vgs "$SOURCE_VG" &>/dev/null; then
-                log "INFO" "Removing incomplete target VG ${SOURCE_VG}..."
-                vgchange -an "$SOURCE_VG" 2>/dev/null || true
-                vgremove -f "$SOURCE_VG" 2>/dev/null || true
-            fi
-            vgrename "$SOURCE_VG_BACKUP" "$SOURCE_VG" 2>/dev/null || true
-            vgchange -ay "$SOURCE_VG" 2>/dev/null || true
-        fi
-    fi
+    # Note: we intentionally do NOT rename source VG back on failure.
+    # The source VG stays as ${SOURCE_VG}_mig to avoid cleanup conflicts
+    # with DM entries from the target VG. The VM will be rebooted/recreated
+    # by the orchestrator anyway, and the source disk is untouched.
 }
 
 trap cleanup EXIT
@@ -1542,10 +1532,6 @@ main() {
 
     # Phase 4: Fixup
     fixup_target
-
-    # Clear SOURCE_VG_BACKUP so cleanup doesn't roll back a completed migration
-    # (target VG now owns the original name; source stays as rootvg_mig until disk is detached)
-    SOURCE_VG_BACKUP=""
 
     # Phase 5: Verify
     verify_target

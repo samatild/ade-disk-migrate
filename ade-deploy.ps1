@@ -678,6 +678,22 @@ try {
 
     Write-Host ""
     Write-OK "Done!"
+
+    # LVM warning: source VG was renamed during migration and not reverted
+    if ($summaryData['USE_LVM'] -eq 'true') {
+        Write-Host ""
+        Write-Host "  ┌──────────────────────────────────────────────────────┐" -ForegroundColor Yellow
+        Write-Host "  │  LVM Notice                                         │" -ForegroundColor Yellow
+        Write-Host "  ├──────────────────────────────────────────────────────┤" -ForegroundColor Yellow
+        Write-Host "  │  The source VM's VG was renamed during migration    │" -ForegroundColor Yellow
+        Write-Host "  │  (e.g. rootvg -> rootvg_mig). If you need to       │" -ForegroundColor Yellow
+        Write-Host "  │  reuse the source VM, rename it back manually:      │" -ForegroundColor Yellow
+        Write-Host "  │                                                     │" -ForegroundColor Yellow
+        Write-Host "  │    sudo vgrename rootvg_mig rootvg                  │" -ForegroundColor Yellow
+        Write-Host "  │    sudo reboot                                      │" -ForegroundColor Yellow
+        Write-Host "  └──────────────────────────────────────────────────────┘" -ForegroundColor Yellow
+    }
+
     Write-Host ""
 
 } catch {
