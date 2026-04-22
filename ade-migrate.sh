@@ -1268,6 +1268,21 @@ fixup_target() {
             sed -i 's/^\(GRUB_CMDLINE_LINUX=\"\)/\1rd.luks=0 rd.ade=0 /' "$grub_defaults"
             detail "Added rd.luks=0 rd.ade=0 to kernel command line"
         fi
+        # Disable os-prober to prevent detecting source OS and creating duplicate entries
+        if ! grep -q 'GRUB_DISABLE_OS_PROBER' "$grub_defaults"; then
+            echo 'GRUB_DISABLE_OS_PROBER=true' >> "$grub_defaults"
+        else
+            sed -i 's/^GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=true/' "$grub_defaults"
+        fi
+        detail "Disabled os-prober in GRUB defaults"
+        # Ensure GRUB boots automatically (Azure serial console compatible)
+        sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' "$grub_defaults"
+        if ! grep -q '^GRUB_TIMEOUT_STYLE' "$grub_defaults"; then
+            echo 'GRUB_TIMEOUT_STYLE=countdown' >> "$grub_defaults"
+        else
+            sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=countdown/' "$grub_defaults"
+        fi
+        detail "Set GRUB timeout to 10s countdown"
         detail "Cleaned encryption references from GRUB defaults"
     fi
 
