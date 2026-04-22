@@ -1,0 +1,12 @@
+# Logs
+*.log
+
+# Editor
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Copilot instructions
+.github/copilot-instructions.md
