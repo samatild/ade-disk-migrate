@@ -25,6 +25,18 @@ SKIP_CONFIRM=false
 FORCE=false
 CLEANUP_MOUNTS=()
 
+# --- LVM globals ---
+USE_LVM=false
+SOURCE_VG=""
+SOURCE_VG_BACKUP=""   # temp name for source VG during migration
+BOOT_PART_NUM=""
+DATA_PART_NUM=""
+DISTRO=""          # "ubuntu", "rhel", or "unknown"
+LV_NAMES=()        # e.g., (rootlv homelv tmplv usrlv varlv)
+LV_SIZES=()        # e.g., (2.00g 1.00g 2.00g 10.00g 8.00g)
+LV_MOUNTS=()       # e.g., (/ /home /tmp /usr /var)
+LV_FSTYPES=()      # e.g., (xfs xfs xfs xfs xfs)
+
 # --- Colors ---
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -165,7 +177,7 @@ check_root() {
 }
 
 check_dependencies() {
-    local deps=(lsblk blkid blockdev sgdisk parted rsync mkfs.ext4 mkfs.ext2 mkfs.vfat mount umount dd sed grep awk)
+    local deps=(lsblk blkid blockdev sgdisk parted rsync mkfs.ext4 mkfs.ext2 mkfs.vfat mount umount dd sed grep awk findmnt lvs pvs vgs)
     local missing=()
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -196,6 +208,20 @@ cleanup() {
             rmdir "$mnt" 2>/dev/null || true
         fi
     done
+    # Restore source VG name if it was temporarily renamed (only on failure)
+    if [[ -n "$SOURCE_VG_BACKUP" ]] && [[ -n "$SOURCE_VG" ]]; then
+        if vgs "$SOURCE_VG_BACKUP" &>/dev/null; then
+            log "INFO" "Restoring source VG name: ${SOURCE_VG_BACKUP} -> ${SOURCE_VG}"
+            # Remove the (partially created) target VG if it took the original name
+            if vgs "$SOURCE_VG" &>/dev/null; then
+                log "INFO" "Removing incomplete target VG ${SOURCE_VG}..."
+                vgchange -an "$SOURCE_VG" 2>/dev/null || true
+                vgremove -f "$SOURCE_VG" 2>/dev/null || true
+            fi
+            vgrename "$SOURCE_VG_BACKUP" "$SOURCE_VG" 2>/dev/null || true
+            vgchange -ay "$SOURCE_VG" 2>/dev/null || true
+        fi
+    fi
 }
 
 trap cleanup EXIT
@@ -207,80 +233,156 @@ trap cleanup EXIT
 detect_os_disk() {
     print_header "Phase 1: OS Disk Detection"
 
+    # Step 0: Detect distro
+    if [[ -f /etc/os-release ]]; then
+        local distro_id
+        distro_id=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"' || true)
+        case "$distro_id" in
+            ubuntu|debian) DISTRO="ubuntu" ;;
+            rhel|centos|almalinux|rocky|ol|fedora) DISTRO="rhel" ;;
+            *) DISTRO="unknown" ;;
+        esac
+    else
+        DISTRO="unknown"
+    fi
+    info "Detected distro family: ${BOLD}${DISTRO}${NC}"
+
     # Step 1: Find root mount device
     local root_dev
     root_dev=$(findmnt -n -o SOURCE / 2>/dev/null) || die "Cannot determine root mount"
     info "Root filesystem mounted from: ${BOLD}${root_dev}${NC}"
-    log "INFO" "Root device: $root_dev"cd /
+    log "INFO" "Root device: $root_dev"
 
-    # Step 2: Check if root is on a dm-crypt device
+    # Step 2: Check if root is on an LVM logical volume
     if [[ "$root_dev" == /dev/mapper/* ]] || [[ "$root_dev" == /dev/dm-* ]]; then
-        DM_NAME=$(basename "$root_dev")
-        info "Encrypted volume detected: ${BOLD}${DM_NAME}${NC}"
+        local dm_basename
+        dm_basename=$(basename "$root_dev")
 
-        # Resolve to parent device through dm
-        local dm_num
+        # Check if it's an LV by querying lvs
+        local lv_check
+        lv_check=$(lvs --noheadings -o vg_name "$root_dev" 2>/dev/null | tr -d ' ' || true)
 
-        # Get the dm number
-        if [[ "$root_dev" == /dev/mapper/* ]]; then
-            dm_num=$(stat -L --format='%T' "$root_dev" 2>/dev/null | xargs printf "%d" 2>/dev/null) || true
-            if [[ -z "$dm_num" ]]; then
-                # Alternative: look up through dmsetup
-                dm_num=$(dmsetup info -c --noheadings -o minor "$DM_NAME" 2>/dev/null) || true
+        if [[ -n "$lv_check" ]]; then
+            # --- LVM path ---
+            USE_LVM=true
+            SOURCE_VG="$lv_check"
+            info "LVM detected: VG=${BOLD}${SOURCE_VG}${NC}"
+
+            # Enumerate all LVs in the VG
+            local lv_line
+            while IFS= read -r lv_line; do
+                local lv_name lv_size lv_path lv_fstype lv_mount
+                lv_name=$(echo "$lv_line" | awk '{print $1}')
+                lv_size=$(echo "$lv_line" | awk '{print $2}')
+                lv_path="/dev/${SOURCE_VG}/${lv_name}"
+                lv_fstype=$(blkid -o value -s TYPE "$lv_path" 2>/dev/null || echo "unknown")
+                lv_mount=$(findmnt -n -o TARGET "$lv_path" 2>/dev/null | head -1 || true)
+                LV_NAMES+=("$lv_name")
+                LV_SIZES+=("$lv_size")
+                LV_MOUNTS+=("$lv_mount")
+                LV_FSTYPES+=("$lv_fstype")
+                detail "LV: ${lv_name} (${lv_size}, ${lv_fstype}) ${ARROW} ${lv_mount}"
+            done < <(lvs --noheadings -o lv_name,lv_size --nosuffix --units g "$SOURCE_VG" 2>/dev/null | sed 's/^[ ]*//')
+
+            if [[ ${#LV_NAMES[@]} -eq 0 ]]; then
+                die "No logical volumes found in VG ${SOURCE_VG}"
             fi
-        fi
 
-        # Find the physical disk backing the crypt device
-        local slaves_dir=""
-        for d in /sys/block/dm-*/slaves/*; do
-            if [[ -d "$d" ]]; then
-                local dm_block
-                dm_block=$(basename "$(dirname "$(dirname "$d")")")
-                # Check if this dm maps to our root device
-                if [[ -e "/dev/mapper/${DM_NAME}" ]]; then
+            # Find the PV backing the VG
+            local pv_dev
+            pv_dev=$(pvs --noheadings -o pv_name -S "vg_name=${SOURCE_VG}" 2>/dev/null | tr -d ' ' | head -1)
+            info "PV backing VG: ${BOLD}${pv_dev}${NC}"
+
+            # Check if PV is on a dm-crypt device
+            if [[ "$pv_dev" == /dev/mapper/* ]]; then
+                DM_NAME=$(basename "$pv_dev")
+                info "Encrypted volume (PV on dm-crypt): ${BOLD}${DM_NAME}${NC}"
+
+                # Walk up the DM slave chain to find the physical disk
+                local current_dm="$DM_NAME"
+                local phys_dev=""
+                while true; do
                     local resolved
-                    resolved=$(readlink -f "/dev/mapper/${DM_NAME}" 2>/dev/null) || true
-                    if [[ "/dev/${dm_block}" == "$resolved" ]] || [[ -e "$d" ]]; then
-                        slaves_dir="$(dirname "$d")"
+                    resolved=$(readlink -f "/dev/mapper/${current_dm}" 2>/dev/null) || break
+                    local dm_sysname
+                    dm_sysname=$(basename "$resolved")
+                    local slaves_path="/sys/class/block/${dm_sysname}/slaves"
+                    if [[ ! -d "$slaves_path" ]] || [[ -z "$(ls -A "$slaves_path" 2>/dev/null)" ]]; then
                         break
                     fi
-                fi
-            fi
-        done
+                    local slave
+                    slave=$(ls "$slaves_path" 2>/dev/null | head -1)
+                    if [[ "$slave" == dm-* ]]; then
+                        # Another DM device — look up its mapper name and continue
+                        local mapper_name
+                        mapper_name=$(cat "/sys/class/block/${slave}/dm/name" 2>/dev/null || echo "$slave")
+                        current_dm="$mapper_name"
+                    else
+                        # Physical device (partition like sda2)
+                        phys_dev="$slave"
+                        break
+                    fi
+                done
 
-        # Fallback: use dmsetup table to find the underlying device
-        if [[ -z "$slaves_dir" ]]; then
-            # Try /sys/class/block approach
+                if [[ -n "$phys_dev" ]]; then
+                    detail "Physical partition: /dev/${phys_dev}"
+                    SOURCE_DISK=$(lsblk -n -o PKNAME "/dev/${phys_dev}" 2>/dev/null | head -1)
+                fi
+            elif [[ "$pv_dev" == /dev/dm-* ]]; then
+                # PV is on a dm device referenced by dm-N path
+                DM_NAME=$(cat "/sys/class/block/$(basename "$pv_dev")/dm/name" 2>/dev/null || basename "$pv_dev")
+                info "Encrypted volume (PV on dm): ${BOLD}${DM_NAME}${NC}"
+                # Same slave-walk logic
+                SOURCE_DISK=$(lsblk -n -o PKNAME "$pv_dev" 2>/dev/null | head -1)
+            else
+                # PV is on a regular partition (non-encrypted LVM)
+                detail "PV on regular partition: ${pv_dev}"
+                DM_NAME=""
+                SOURCE_DISK=$(lsblk -n -o PKNAME "$pv_dev" 2>/dev/null | head -1)
+            fi
+
+            # ROOT_FSTYPE from the root LV
+            ROOT_FSTYPE=$(findmnt -n -o FSTYPE / 2>/dev/null) || ROOT_FSTYPE="ext4"
+
+        else
+            # --- Non-LVM dm-crypt path (existing logic) ---
+            DM_NAME="$dm_basename"
+            info "Encrypted volume detected: ${BOLD}${DM_NAME}${NC}"
+
+            local slaves_dir=""
             local dm_sysname
             dm_sysname=$(basename "$(readlink -f "/dev/mapper/${DM_NAME}")" 2>/dev/null) || true
             if [[ -n "$dm_sysname" ]] && [[ -d "/sys/class/block/${dm_sysname}/slaves" ]]; then
                 slaves_dir="/sys/class/block/${dm_sysname}/slaves"
             fi
-        fi
 
-        if [[ -n "$slaves_dir" ]] && [[ -d "$slaves_dir" ]]; then
-            local slave_dev
-            slave_dev=$(find "$slaves_dir" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | head -1)
-            if [[ -n "$slave_dev" ]]; then
-                detail "Encrypted partition: /dev/${slave_dev}"
-                # Get parent disk (strip partition number)
-                SOURCE_DISK=$(lsblk -n -o PKNAME "/dev/${slave_dev}" 2>/dev/null | head -1)
-                if [[ -z "$SOURCE_DISK" ]]; then
-                    # Fallback: strip trailing digits
-                    # Fallback: strip trailing digits
+            if [[ -n "$slaves_dir" ]] && [[ -d "$slaves_dir" ]]; then
+                local slave_dev
+                slave_dev=$(find "$slaves_dir" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | head -1)
+                if [[ -n "$slave_dev" ]]; then
+                    detail "Encrypted partition: /dev/${slave_dev}"
                     SOURCE_DISK=$(lsblk -n -o PKNAME "/dev/${slave_dev}" 2>/dev/null | head -1)
                 fi
             fi
-        fi
 
-        # Final fallback: use Azure symlinks
-        if [[ -z "$SOURCE_DISK" ]] && [[ -L /dev/disk/azure/root ]]; then
-            SOURCE_DISK=$(basename "$(readlink -f /dev/disk/azure/root)")
-            detail "Detected via Azure symlink"
+            # Fallback: Azure symlinks
+            if [[ -z "$SOURCE_DISK" ]] && [[ -L /dev/disk/azure/root ]]; then
+                SOURCE_DISK=$(basename "$(readlink -f /dev/disk/azure/root)")
+                detail "Detected via Azure symlink"
+            fi
+
+            ROOT_FSTYPE=$(findmnt -n -o FSTYPE / 2>/dev/null) || ROOT_FSTYPE="ext4"
         fi
     else
-        # Not encrypted — find parent disk directly
+        # Not on DM — find parent disk directly
         SOURCE_DISK=$(lsblk -n -o PKNAME "$root_dev" 2>/dev/null | head -1)
+        ROOT_FSTYPE=$(findmnt -n -o FSTYPE / 2>/dev/null) || ROOT_FSTYPE="ext4"
+    fi
+
+    # Fallback: Azure symlinks
+    if [[ -z "$SOURCE_DISK" ]] && [[ -L /dev/disk/azure/root ]]; then
+        SOURCE_DISK=$(basename "$(readlink -f /dev/disk/azure/root)")
+        detail "Detected via Azure symlink"
     fi
 
     if [[ -z "$SOURCE_DISK" ]]; then
@@ -289,10 +391,37 @@ detect_os_disk() {
 
     validate_dev_path "/dev/$SOURCE_DISK"
 
-    # Get filesystem type of root
-    ROOT_FSTYPE=$(findmnt -n -o FSTYPE / 2>/dev/null) || ROOT_FSTYPE="ext4"
+    # Detect partition layout: which partition is /boot, which is data (root/LVM)
+    local boot_dev
+    boot_dev=$(findmnt -n -o SOURCE /boot 2>/dev/null | head -1 || true)
+    if [[ -n "$boot_dev" ]]; then
+        # Extract partition number from device path
+        local boot_part_suffix
+        boot_part_suffix=$(echo "$boot_dev" | grep -oP '(\d+)$' || true)
+        if [[ -n "$boot_part_suffix" ]]; then
+            BOOT_PART_NUM="$boot_part_suffix"
+        fi
+    fi
+    # Defaults if not detected
+    if [[ -z "$BOOT_PART_NUM" ]]; then
+        if $USE_LVM; then
+            BOOT_PART_NUM=1
+        else
+            BOOT_PART_NUM=2
+        fi
+    fi
+    # Data partition is the "other" of 1 and 2
+    if [[ "$BOOT_PART_NUM" == "1" ]]; then
+        DATA_PART_NUM=2
+    else
+        DATA_PART_NUM=1
+    fi
 
     success "OS Disk identified: ${BOLD}/dev/${SOURCE_DISK}${NC}"
+    detail "Boot partition: ${BOOT_PART_NUM}, Data partition: ${DATA_PART_NUM}"
+    if $USE_LVM; then
+        detail "LVM: VG=${SOURCE_VG}, ${#LV_NAMES[@]} LVs"
+    fi
     echo ""
 
     # Display partition layout
@@ -405,8 +534,17 @@ print_summary() {
 
     echo -e "  ${BOLD}Source (encrypted):${NC}"
     detail "Disk:       /dev/${SOURCE_DISK}"
-    detail "Crypt map:  /dev/mapper/${DM_NAME}"
-    detail "Root FS:    ${ROOT_FSTYPE}"
+    if [[ -n "$DM_NAME" ]]; then
+        detail "Crypt map:  /dev/mapper/${DM_NAME}"
+    fi
+    if $USE_LVM; then
+        detail "VG:         ${SOURCE_VG} (${#LV_NAMES[@]} LVs)"
+        for i in "${!LV_NAMES[@]}"; do
+            detail "  LV: ${LV_NAMES[$i]} (${LV_SIZES[$i]}g, ${LV_FSTYPES[$i]}) ${ARROW} ${LV_MOUNTS[$i]}"
+        done
+    else
+        detail "Root FS:    ${ROOT_FSTYPE}"
+    fi
     echo ""
     echo -e "  ${BOLD}Target (raw):${NC}"
     detail "Disk:       /dev/${TARGET_DISK}"
@@ -473,7 +611,11 @@ replicate_partition_table() {
         p2_start=$(sgdisk -i 2 "/dev/${TARGET_DISK}" 2>/dev/null | grep "First sector" | awk '{print $3}')
         if [[ -n "$p2_start" ]]; then
             local p2_end=$(( tgt_sectors - 34 ))  # GPT backup header takes 34 sectors
-            sgdisk -d 2 -n 2:"${p2_start}":"${p2_end}" -t 2:8300 "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
+            local p2_type="8300"
+            if $USE_LVM; then
+                p2_type="8E00"
+            fi
+            sgdisk -d 2 -n 2:"${p2_start}":"${p2_end}" -t 2:"${p2_type}" "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
                 warn "Partition 2 resize may need manual fixup"
             detail "Adjusted partition 2 end to fit target disk"
         fi
@@ -580,9 +722,9 @@ copy_efi_partition() {
 
 copy_boot_partition() {
     local src_part
-    src_part=$(get_partition_dev "$SOURCE_DISK" 2)
+    src_part=$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")
     local tgt_part
-    tgt_part=$(get_partition_dev "$TARGET_DISK" 2)
+    tgt_part=$(get_partition_dev "$TARGET_DISK" "$BOOT_PART_NUM")
 
     if [[ ! -b "$src_part" ]]; then
         warn "No /boot partition found — skipping"
@@ -644,7 +786,7 @@ copy_boot_partition() {
 
 copy_root_partition() {
     local tgt_part
-    tgt_part=$(get_partition_dev "$TARGET_DISK" 1)
+    tgt_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
 
     info "Creating ${ROOT_FSTYPE} filesystem on root partition..."
     if $DRY_RUN; then
@@ -746,6 +888,191 @@ copy_root_partition() {
     success "Root filesystem data copied"
 }
 
+copy_lvm_partitions() {
+    local tgt_part
+    tgt_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
+
+    if $DRY_RUN; then
+        info "[DRY RUN] Would create LVM layout on ${tgt_part}:"
+        detail "PV: ${tgt_part}"
+        detail "VG: ${SOURCE_VG}"
+        for i in "${!LV_NAMES[@]}"; do
+            detail "LV: ${LV_NAMES[$i]} (${LV_SIZES[$i]}g, ${LV_FSTYPES[$i]}) ${ARROW} ${LV_MOUNTS[$i]}"
+        done
+        return
+    fi
+
+    # Step 1: Create PV on target partition
+    info "Creating LVM Physical Volume on ${tgt_part}..."
+    pvcreate -f "$tgt_part" >> "$LOG_FILE" 2>&1 || \
+        die "Failed to create PV on ${tgt_part}"
+    success "PV created"
+
+    # Step 2: Temporarily rename source VG so we can create target with original name
+    SOURCE_VG_BACKUP="${SOURCE_VG}_mig"
+    info "Temporarily renaming source VG ${BOLD}${SOURCE_VG}${NC} ${ARROW} ${SOURCE_VG_BACKUP}..."
+    vgrename "$SOURCE_VG" "$SOURCE_VG_BACKUP" >> "$LOG_FILE" 2>&1 || \
+        die "Failed to rename source VG"
+    success "Source VG renamed to ${SOURCE_VG_BACKUP}"
+
+    # Step 3: Create target VG with the original name
+    info "Creating Volume Group ${BOLD}${SOURCE_VG}${NC} on target..."
+    vgcreate "$SOURCE_VG" "$tgt_part" >> "$LOG_FILE" 2>&1 || \
+        die "Failed to create VG ${SOURCE_VG}"
+    success "VG ${SOURCE_VG} created"
+
+    # Step 4: Create LVs, format, and copy data
+    # Sort LVs so rootlv (/) is first, then others in mount-point depth order
+    local sorted_indices=()
+    local root_idx=""
+    for i in "${!LV_NAMES[@]}"; do
+        if [[ "${LV_MOUNTS[$i]}" == "/" ]]; then
+            root_idx=$i
+        fi
+    done
+    if [[ -n "$root_idx" ]]; then
+        sorted_indices+=("$root_idx")
+    fi
+    for i in "${!LV_NAMES[@]}"; do
+        if [[ "$i" != "$root_idx" ]]; then
+            sorted_indices+=("$i")
+        fi
+    done
+
+    local tgt_root_mnt="/tmp/azmigrate_root_tgt_${TIMESTAMP}"
+    mkdir -p "$tgt_root_mnt"
+
+    for idx in "${sorted_indices[@]}"; do
+        local lv_name="${LV_NAMES[$idx]}"
+        local lv_size="${LV_SIZES[$idx]}"
+        local lv_mount="${LV_MOUNTS[$idx]}"
+        local lv_fstype="${LV_FSTYPES[$idx]}"
+        local src_lv_path="/dev/${SOURCE_VG_BACKUP}/${lv_name}"
+        local tgt_lv_path="/dev/${SOURCE_VG}/${lv_name}"
+
+        info "Creating LV ${BOLD}${lv_name}${NC} (${lv_size}g)..."
+        lvcreate --yes -n "$lv_name" -L "${lv_size}g" "$SOURCE_VG" >> "$LOG_FILE" 2>&1 || \
+            die "Failed to create LV ${lv_name}"
+
+        # Create filesystem
+        info "Creating ${lv_fstype} filesystem on ${lv_name}..."
+        case "$lv_fstype" in
+            ext4) mkfs.ext4 -q "$tgt_lv_path" >> "$LOG_FILE" 2>&1 ;;
+            ext3) mkfs.ext3 -q "$tgt_lv_path" >> "$LOG_FILE" 2>&1 ;;
+            xfs)  mkfs.xfs -f "$tgt_lv_path" >> "$LOG_FILE" 2>&1 ;;
+            swap) mkswap "$tgt_lv_path" >> "$LOG_FILE" 2>&1; continue ;;
+            *) die "Unsupported filesystem for LV ${lv_name}: ${lv_fstype}" ;;
+        esac
+
+        # Determine mount point for this LV inside the target tree
+        local tgt_mnt_point
+        if [[ "$lv_mount" == "/" ]]; then
+            tgt_mnt_point="$tgt_root_mnt"
+        else
+            tgt_mnt_point="${tgt_root_mnt}${lv_mount}"
+            mkdir -p "$tgt_mnt_point"
+        fi
+
+        # Mount target LV
+        mount "$tgt_lv_path" "$tgt_mnt_point" >> "$LOG_FILE" 2>&1
+        CLEANUP_MOUNTS+=("$tgt_mnt_point")
+
+        # Find source LV mount point — use known mount from detection if available
+        local src_mnt
+        local src_mounted_here=false
+        if [[ -n "$lv_mount" ]]; then
+            # LV was mounted at detection time; use that path directly
+            src_mnt="$lv_mount"
+        else
+            # LV not mounted — try to mount read-only
+            src_mnt="/tmp/azmigrate_lv_src_${lv_name}_${TIMESTAMP}"
+            mkdir -p "$src_mnt"
+            mount -o ro "$src_lv_path" "$src_mnt" >> "$LOG_FILE" 2>&1
+            CLEANUP_MOUNTS+=("$src_mnt")
+            src_mounted_here=true
+        fi
+
+        # Copy data with progress
+        info "Copying ${BOLD}${lv_name}${NC} (${lv_mount})..."
+        local src_used_bytes
+        src_used_bytes=$(df -B1 --output=used "$src_mnt" 2>/dev/null | tail -1 | tr -d ' ') || src_used_bytes=0
+
+        rsync -aAX --no-i-r --one-file-system "$src_mnt/" "$tgt_mnt_point/" \
+            --exclude='/lost+found' \
+            --exclude='/var/log/azmigrate*' \
+            --exclude='/var/lib/lxcfs/*' \
+            >> "$LOG_FILE" 2>&1 &
+        local rsync_pid=$!
+
+        # Progress bar
+        local bar_width=40
+        while kill -0 "$rsync_pid" 2>/dev/null; do
+            local copied_bytes
+            copied_bytes=$(df -B1 --output=used "$tgt_mnt_point" 2>/dev/null | tail -1 | tr -d ' ') || copied_bytes=0
+            if (( src_used_bytes > 0 )) && (( copied_bytes > 0 )); then
+                local pct=$(( copied_bytes * 100 / src_used_bytes ))
+                (( pct > 100 )) && pct=100
+                local filled=$(( pct * bar_width / 100 ))
+                local empty=$(( bar_width - filled ))
+                local bar=""
+                local ii
+                for (( ii=0; ii<filled; ii++ )); do bar+="█"; done
+                for (( ii=0; ii<empty; ii++ )); do bar+="░"; done
+                echo -ne "\r    ${CYAN}[${bar}]${NC} ${BOLD}${pct}%%${NC}  "
+            fi
+            sleep 2
+        done
+
+        local rc=0
+        wait "$rsync_pid" || rc=$?
+        echo -ne "\r\033[2K"
+
+        if [[ $rc -ne 0 ]] && [[ $rc -ne 24 ]] && [[ $rc -ne 23 ]]; then
+            die "rsync failed for LV ${lv_name} with exit code $rc"
+        fi
+
+        if $src_mounted_here; then
+            umount "$src_mnt" 2>/dev/null || true
+        fi
+
+        success "${lv_name} copied"
+    done
+
+    # Create standard empty mountpoints on root LV
+    mkdir -p "$tgt_root_mnt"/{proc,sys,dev,run,tmp,mnt,media}
+
+    success "All LVM logical volumes copied"
+
+    # Step 5: Unmount all target LVs, remount for fixup phase
+
+    # Unmount in reverse order (deepest first)
+    for (( i=${#sorted_indices[@]}-1; i>=0; i-- )); do
+        local idx="${sorted_indices[$i]}"
+        local lv_mount="${LV_MOUNTS[$idx]}"
+        local tgt_mnt_point
+        if [[ "$lv_mount" == "/" ]]; then
+            tgt_mnt_point="$tgt_root_mnt"
+        else
+            tgt_mnt_point="${tgt_root_mnt}${lv_mount}"
+        fi
+        umount "$tgt_mnt_point" 2>/dev/null || true
+    done
+
+    # Remount target root for fixup phase
+    mount "/dev/${SOURCE_VG}/rootlv" "$tgt_root_mnt" >> "$LOG_FILE" 2>&1
+    CLEANUP_MOUNTS+=("$tgt_root_mnt")
+
+    # Mount other LVs inside root for fixup
+    for idx in "${sorted_indices[@]}"; do
+        local lv_mount="${LV_MOUNTS[$idx]}"
+        [[ "$lv_mount" == "/" ]] && continue
+        local tgt_mnt_point="${tgt_root_mnt}${lv_mount}"
+        mkdir -p "$tgt_mnt_point"
+        mount "/dev/${SOURCE_VG}/${LV_NAMES[$idx]}" "$tgt_mnt_point" >> "$LOG_FILE" 2>&1
+        CLEANUP_MOUNTS+=("$tgt_mnt_point")
+    done
+}
+
 ###############################################################################
 # Phase 4: Post-Copy Fixup
 ###############################################################################
@@ -759,19 +1086,24 @@ fixup_target() {
     fi
 
     local tgt_root="/tmp/azmigrate_root_tgt_${TIMESTAMP}"
-    # Ensure root is mounted
-    local tgt_root_part
-    tgt_root_part=$(get_partition_dev "$TARGET_DISK" 1)
+
+    # --- Mount target root if not already mounted ---
     if ! mountpoint -q "$tgt_root" 2>/dev/null; then
         mkdir -p "$tgt_root"
-        mount "$tgt_root_part" "$tgt_root" >> "$LOG_FILE" 2>&1
+        if $USE_LVM; then
+            mount "/dev/${SOURCE_VG}/rootlv" "$tgt_root" >> "$LOG_FILE" 2>&1
+        else
+            local tgt_root_part
+            tgt_root_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
+            mount "$tgt_root_part" "$tgt_root" >> "$LOG_FILE" 2>&1
+        fi
         CLEANUP_MOUNTS+=("$tgt_root")
     fi
 
     # Mount boot inside root
     local tgt_boot_part
-    tgt_boot_part=$(get_partition_dev "$TARGET_DISK" 2)
-    if [[ -b "$tgt_boot_part" ]]; then
+    tgt_boot_part=$(get_partition_dev "$TARGET_DISK" "$BOOT_PART_NUM")
+    if [[ -b "$tgt_boot_part" ]] && ! mountpoint -q "$tgt_root/boot" 2>/dev/null; then
         mkdir -p "$tgt_root/boot"
         mount "$tgt_boot_part" "$tgt_root/boot" >> "$LOG_FILE" 2>&1
         CLEANUP_MOUNTS+=("$tgt_root/boot")
@@ -780,7 +1112,7 @@ fixup_target() {
     # Mount EFI inside root
     local tgt_efi_part
     tgt_efi_part=$(get_partition_dev "$TARGET_DISK" 15)
-    if [[ -b "$tgt_efi_part" ]]; then
+    if [[ -b "$tgt_efi_part" ]] && ! mountpoint -q "$tgt_root/boot/efi" 2>/dev/null; then
         mkdir -p "$tgt_root/boot/efi"
         mount "$tgt_efi_part" "$tgt_root/boot/efi" >> "$LOG_FILE" 2>&1
         CLEANUP_MOUNTS+=("$tgt_root/boot/efi")
@@ -794,34 +1126,53 @@ fixup_target() {
         # Backup original
         cp "$fstab_file" "${fstab_file}.bak.${TIMESTAMP}"
 
-        # Get old UUIDs (source)
-        local old_root_uuid
-        old_root_uuid=$(blkid -o value -s UUID "/dev/mapper/${DM_NAME}" 2>/dev/null || true)
-        local old_boot_uuid
-        old_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 2)" 2>/dev/null || true)
-        local old_efi_uuid
-        old_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
+        if $USE_LVM; then
+            # LVM fstab fixup:
+            # VG name is already correct (target created with original name)
+            # Just update boot and EFI UUIDs
+            local old_boot_uuid new_boot_uuid old_efi_uuid new_efi_uuid
+            old_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+            new_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
+            old_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
+            new_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
 
-        # Get new UUIDs (target)
-        local new_root_uuid
-        new_root_uuid=$(blkid -o value -s UUID "$tgt_root_part" 2>/dev/null || true)
-        local new_boot_uuid
-        new_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
-        local new_efi_uuid
-        new_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
+            if [[ -n "$old_boot_uuid" ]] && [[ -n "$new_boot_uuid" ]]; then
+                sed -i "s/${old_boot_uuid}/${new_boot_uuid}/g" "$fstab_file"
+                detail "Boot UUID: ${old_boot_uuid} ${ARROW} ${new_boot_uuid}"
+            fi
+            if [[ -n "$old_efi_uuid" ]] && [[ -n "$new_efi_uuid" ]]; then
+                sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
+                detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
+            fi
+            # Remove BEK volume line from fstab
+            if grep -q "BEK" "$fstab_file" 2>/dev/null; then
+                sed -i '/BEK/d' "$fstab_file"
+                detail "Removed BEK volume entry from fstab"
+            fi
+        else
+            # Non-LVM fstab fixup: replace root/boot/EFI UUIDs
+            local old_root_uuid new_root_uuid old_boot_uuid new_boot_uuid old_efi_uuid new_efi_uuid
+            local tgt_root_part
+            tgt_root_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
+            old_root_uuid=$(blkid -o value -s UUID "/dev/mapper/${DM_NAME}" 2>/dev/null || true)
+            new_root_uuid=$(blkid -o value -s UUID "$tgt_root_part" 2>/dev/null || true)
+            old_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+            new_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
+            old_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
+            new_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
 
-        # Replace UUIDs
-        if [[ -n "$old_root_uuid" ]] && [[ -n "$new_root_uuid" ]]; then
-            sed -i "s/${old_root_uuid}/${new_root_uuid}/g" "$fstab_file"
-            detail "Root UUID: ${old_root_uuid} ${ARROW} ${new_root_uuid}"
-        fi
-        if [[ -n "$old_boot_uuid" ]] && [[ -n "$new_boot_uuid" ]]; then
-            sed -i "s/${old_boot_uuid}/${new_boot_uuid}/g" "$fstab_file"
-            detail "Boot UUID: ${old_boot_uuid} ${ARROW} ${new_boot_uuid}"
-        fi
-        if [[ -n "$old_efi_uuid" ]] && [[ -n "$new_efi_uuid" ]]; then
-            sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
-            detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
+            if [[ -n "$old_root_uuid" ]] && [[ -n "$new_root_uuid" ]]; then
+                sed -i "s/${old_root_uuid}/${new_root_uuid}/g" "$fstab_file"
+                detail "Root UUID: ${old_root_uuid} ${ARROW} ${new_root_uuid}"
+            fi
+            if [[ -n "$old_boot_uuid" ]] && [[ -n "$new_boot_uuid" ]]; then
+                sed -i "s/${old_boot_uuid}/${new_boot_uuid}/g" "$fstab_file"
+                detail "Boot UUID: ${old_boot_uuid} ${ARROW} ${new_boot_uuid}"
+            fi
+            if [[ -n "$old_efi_uuid" ]] && [[ -n "$new_efi_uuid" ]]; then
+                sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
+                detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
+            fi
         fi
 
         success "fstab updated"
@@ -833,7 +1184,6 @@ fixup_target() {
     local crypttab_file="$tgt_root/etc/crypttab"
     if [[ -f "$crypttab_file" ]]; then
         cp "$crypttab_file" "${crypttab_file}.bak.${TIMESTAMP}"
-        # Empty the file but keep it (some tools expect it to exist)
         echo "# Cleared by azmigrate — encryption removed" > "$crypttab_file"
         info "Cleared /etc/crypttab"
     fi
@@ -846,12 +1196,13 @@ fixup_target() {
 
     # --- Remove Azure Disk Encryption artifacts ---
     info "Removing Azure Disk Encryption artifacts..."
-    # ADE key script referenced in crypttab
+    # ADE key script
     if [[ -f "$tgt_root/usr/sbin/azure_crypt_key.sh" ]]; then
         rm -f "$tgt_root/usr/sbin/azure_crypt_key.sh"
         detail "Removed azure_crypt_key.sh"
     fi
-    # ADE initramfs hooks that trigger LUKS unlock at boot
+
+    # Ubuntu-specific ADE hooks (initramfs-tools)
     local ade_hooks=(
         "$tgt_root/etc/initramfs-tools/hooks/azure_crypt_key"
         "$tgt_root/etc/initramfs-tools/hooks/ade"
@@ -864,24 +1215,41 @@ fixup_target() {
             detail "Removed hook: $(basename "$hook")"
         fi
     done
-    # Restore original cryptroot hook if ADE modified it (backup exists as .orig)
     local cryptroot_hook="$tgt_root/usr/share/initramfs-tools/hooks/cryptroot"
     if [[ -f "${cryptroot_hook}.orig" ]]; then
         cp "${cryptroot_hook}.orig" "$cryptroot_hook"
         detail "Restored original cryptroot hook"
     fi
-    # Remove cryptsetup from initramfs config if referenced
     if [[ -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot" ]]; then
         rm -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot"
         detail "Removed initramfs cryptroot config"
     fi
-    # Disable cryptsetup in initramfs
     if [[ -f "$tgt_root/etc/cryptsetup-initramfs/conf-hook" ]]; then
         cp "$tgt_root/etc/cryptsetup-initramfs/conf-hook" \
            "$tgt_root/etc/cryptsetup-initramfs/conf-hook.bak.${TIMESTAMP}"
         sed -i 's/^CRYPTSETUP=.*/CRYPTSETUP=n/' "$tgt_root/etc/cryptsetup-initramfs/conf-hook"
         detail "Set CRYPTSETUP=n in initramfs conf-hook"
     fi
+
+    # RHEL-specific ADE artifacts (dracut)
+    if [[ -d "$tgt_root/usr/lib/dracut/modules.d/91adeOnline" ]]; then
+        rm -rf "$tgt_root/usr/lib/dracut/modules.d/91adeOnline"
+        detail "Removed dracut module 91adeOnline"
+    fi
+    if [[ -f "$tgt_root/etc/dracut.conf.d/ade.conf" ]]; then
+        rm -f "$tgt_root/etc/dracut.conf.d/ade.conf"
+        detail "Removed /etc/dracut.conf.d/ade.conf"
+    fi
+    # Remove ADE-specific binaries from target
+    if [[ -f "$tgt_root/usr/sbin/crypt-run-generator-ade" ]]; then
+        rm -f "$tgt_root/usr/sbin/crypt-run-generator-ade"
+        detail "Removed crypt-run-generator-ade binary"
+    fi
+    # Create dracut config to permanently exclude crypt/ADE modules
+    mkdir -p "$tgt_root/etc/dracut.conf.d"
+    echo 'omit_dracutmodules+=" crypt crypt-gpg crypt-loop adeOnline "' \
+        > "$tgt_root/etc/dracut.conf.d/99-no-crypt.conf"
+    detail "Created /etc/dracut.conf.d/99-no-crypt.conf to exclude crypt modules"
 
     # --- Reinstall GRUB ---
     info "Reinstalling GRUB bootloader on target..."
@@ -896,35 +1264,57 @@ fixup_target() {
     mount --bind /run  "$tgt_root/run"  2>/dev/null || true
     CLEANUP_MOUNTS+=("$tgt_root/run")
 
-    # Update GRUB config — remove cryptdevice references
+    # Update GRUB config — remove encryption references
     local grub_defaults="$tgt_root/etc/default/grub"
     if [[ -f "$grub_defaults" ]]; then
         cp "$grub_defaults" "${grub_defaults}.bak.${TIMESTAMP}"
-        # Remove rd.luks or cryptdevice kernel parameters
+        # Remove rd.luks.* and rd.luks.ade.* kernel parameters
         sed -i 's/rd\.luks\.[^ "]*//g' "$grub_defaults"
         sed -i 's/cryptdevice=[^ "]*//g' "$grub_defaults"
+        # Clean up double spaces left behind
+        sed -i 's/  */ /g' "$grub_defaults"
+        # Add rd.luks=0 and rd.ade=0 to disable encryption in initramfs
+        if ! grep -q 'rd.luks=0' "$grub_defaults"; then
+            sed -i 's/^\(GRUB_CMDLINE_LINUX=\"\)/\1rd.luks=0 rd.ade=0 /' "$grub_defaults"
+            detail "Added rd.luks=0 rd.ade=0 to kernel command line"
+        fi
         detail "Cleaned encryption references from GRUB defaults"
     fi
 
-    # --- Regenerate initramfs (remove cryptsetup hooks) ---
+    # --- Regenerate initramfs ---
     info "Regenerating initramfs (removing encryption hooks)..."
     local kernel_ver
     kernel_ver=$(find "$tgt_root/lib/modules/" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -1)
     if [[ -n "$kernel_ver" ]]; then
         detail "Kernel version: ${kernel_ver}"
-        chroot "$tgt_root" update-initramfs -u -k "$kernel_ver" >> "$LOG_FILE" 2>&1 || \
-            warn "update-initramfs failed — may need manual intervention"
+
+        if [[ "$DISTRO" == "rhel" ]]; then
+            # RHEL: use dracut to regenerate initramfs without crypt/ADE modules
+            chroot "$tgt_root" dracut --force --kver "$kernel_ver" \
+                --omit "crypt crypt-gpg crypt-loop" >> "$LOG_FILE" 2>&1 || \
+                warn "dracut failed — may need manual intervention"
+        else
+            # Ubuntu/Debian: use update-initramfs
+            chroot "$tgt_root" update-initramfs -u -k "$kernel_ver" >> "$LOG_FILE" 2>&1 || \
+                warn "update-initramfs failed — may need manual intervention"
+        fi
         success "initramfs regenerated"
     else
         warn "No kernel modules found — skipping initramfs regeneration"
     fi
 
-    # Run grub-install and update-grub in chroot
-    chroot "$tgt_root" grub-install "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
-        warn "grub-install failed — may need manual intervention"
-
-    chroot "$tgt_root" update-grub >> "$LOG_FILE" 2>&1 || \
-        warn "update-grub failed — may need manual intervention"
+    # Install GRUB bootloader
+    if [[ "$DISTRO" == "rhel" ]]; then
+        chroot "$tgt_root" grub2-install "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
+            warn "grub2-install failed — may need manual intervention"
+        chroot "$tgt_root" grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1 || \
+            warn "grub2-mkconfig failed — may need manual intervention"
+    else
+        chroot "$tgt_root" grub-install "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
+            warn "grub-install failed — may need manual intervention"
+        chroot "$tgt_root" update-grub >> "$LOG_FILE" 2>&1 || \
+            warn "update-grub failed — may need manual intervention"
+    fi
 
     success "GRUB bootloader installed"
 
@@ -948,13 +1338,17 @@ verify_target() {
     fi
 
     local tgt_root="/tmp/azmigrate_root_tgt_${TIMESTAMP}"
-    local tgt_root_part
-    tgt_root_part=$(get_partition_dev "$TARGET_DISK" 1)
 
     # Ensure root is still mounted
     if ! mountpoint -q "$tgt_root" 2>/dev/null; then
         mkdir -p "$tgt_root"
-        mount "$tgt_root_part" "$tgt_root" >> "$LOG_FILE" 2>&1
+        if $USE_LVM; then
+            mount "/dev/${SOURCE_VG}/rootlv" "$tgt_root" >> "$LOG_FILE" 2>&1
+        else
+            local tgt_root_part
+            tgt_root_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
+            mount "$tgt_root_part" "$tgt_root" >> "$LOG_FILE" 2>&1
+        fi
         CLEANUP_MOUNTS+=("$tgt_root")
     fi
 
@@ -975,6 +1369,17 @@ verify_target() {
         detail "$line"
     done
 
+    if $USE_LVM; then
+        echo ""
+        info "Target LVM layout:"
+        pvs --noheadings -o pv_name,vg_name,pv_size "/dev/${TARGET_DISK}"* 2>/dev/null | while IFS= read -r line; do
+            detail "PV: $line"
+        done
+        lvs --noheadings -o lv_name,lv_size "$SOURCE_VG" 2>/dev/null | while IFS= read -r line; do
+            detail "LV: $line"
+        done
+    fi
+
     echo ""
     success "Verification complete"
 }
@@ -990,35 +1395,43 @@ print_final_report() {
     echo ""
 
     # Collect summary data
-    local tgt_root_part
-    tgt_root_part=$(get_partition_dev "$TARGET_DISK" 1)
-    local tgt_root_uuid tgt_boot_uuid tgt_efi_uuid
-    tgt_root_uuid=$(blkid -o value -s UUID "$tgt_root_part" 2>/dev/null || echo "n/a")
-    local tgt_boot_part
-    tgt_boot_part=$(get_partition_dev "$TARGET_DISK" 2)
-    tgt_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || echo "n/a")
-    local tgt_efi_part
+    local tgt_boot_part tgt_efi_part
+    tgt_boot_part=$(get_partition_dev "$TARGET_DISK" "$BOOT_PART_NUM")
     tgt_efi_part=$(get_partition_dev "$TARGET_DISK" 15)
+    local tgt_boot_uuid tgt_efi_uuid
+    tgt_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || echo "n/a")
     tgt_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || echo "n/a")
+
+    local tgt_root_uuid="n/a"
+    if $USE_LVM; then
+        tgt_root_uuid="LVM (${SOURCE_VG})"
+    else
+        local tgt_root_part
+        tgt_root_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
+        tgt_root_uuid=$(blkid -o value -s UUID "$tgt_root_part" 2>/dev/null || echo "n/a")
+    fi
 
     local src_size_hr tgt_size_hr
     src_size_hr=$(lsblk -dn -o SIZE "/dev/${SOURCE_DISK}" 2>/dev/null || echo "?")
     tgt_size_hr=$(lsblk -dn -o SIZE "/dev/${TARGET_DISK}" 2>/dev/null || echo "?")
 
-    # Pretty summary table
-    echo -e "  ${CYAN}┌──────────────────────────────────────────────────────┐${NC}"
-    echo -e "  ${CYAN}│${NC}  ${BOLD}Source${NC}                                              ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Disk:       /dev/${SOURCE_DISK} (${src_size_hr}, encrypted)       ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Crypt map:  /dev/mapper/${DM_NAME}                     ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Status:     ${GREEN}Untouched${NC}                               ${CYAN}│${NC}"
-    echo -e "  ${CYAN}├──────────────────────────────────────────────────────┤${NC}"
-    echo -e "  ${CYAN}│${NC}  ${BOLD}Target${NC}                                              ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Disk:       /dev/${TARGET_DISK} (${tgt_size_hr}, raw)             ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Root:       ${tgt_root_uuid}         ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Boot:       ${tgt_boot_uuid}         ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    EFI:        ${tgt_efi_uuid}                        ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}    Status:     ${GREEN}Bootable${NC}                                ${CYAN}│${NC}"
-    echo -e "  ${CYAN}└──────────────────────────────────────────────────────┘${NC}"
+    echo -e "  ${BOLD}Source:${NC} /dev/${SOURCE_DISK} (${src_size_hr}, encrypted) — ${GREEN}Untouched${NC}"
+    if [[ -n "$DM_NAME" ]]; then
+        detail "Crypt: /dev/mapper/${DM_NAME}"
+    fi
+    if $USE_LVM; then
+        detail "VG: ${SOURCE_VG} (${#LV_NAMES[@]} LVs)"
+    fi
+    echo ""
+    echo -e "  ${BOLD}Target:${NC} /dev/${TARGET_DISK} (${tgt_size_hr}, raw) — ${GREEN}Bootable${NC}"
+    detail "Root: ${tgt_root_uuid}"
+    detail "Boot: ${tgt_boot_uuid}"
+    detail "EFI:  ${tgt_efi_uuid}"
+    if $USE_LVM; then
+        for i in "${!LV_NAMES[@]}"; do
+            detail "LV ${LV_NAMES[$i]}: ${LV_SIZES[$i]}g ${ARROW} ${LV_MOUNTS[$i]}"
+        done
+    fi
     echo ""
     info "Log file: ${LOG_FILE}"
     echo ""
@@ -1035,6 +1448,7 @@ print_final_report() {
     echo "EFI_UUID=${tgt_efi_uuid}"
     echo "ROOT_FS=${ROOT_FSTYPE}"
     echo "DM_NAME=${DM_NAME}"
+    echo "USE_LVM=${USE_LVM}"
     echo "LOG_FILE=${LOG_FILE}"
     echo "###MIGRATION_SUMMARY_END###"
 }
@@ -1120,13 +1534,21 @@ main() {
     copy_bios_boot
     copy_efi_partition
     copy_boot_partition
-    copy_root_partition
+    if $USE_LVM; then
+        copy_lvm_partitions
+    else
+        copy_root_partition
+    fi
 
     # Phase 4: Fixup
     fixup_target
 
     # Phase 5: Verify
     verify_target
+
+    # Clear SOURCE_VG_BACKUP so cleanup doesn't rename it back
+    # (target VG now owns the original name; source stays as rootvg_mig until disk is detached)
+    SOURCE_VG_BACKUP=""
 
     # Done
     print_final_report
