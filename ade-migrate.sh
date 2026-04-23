@@ -1143,11 +1143,6 @@ fixup_target() {
                 sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
                 detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
             fi
-            # Remove BEK volume line from fstab
-            if grep -q "BEK" "$fstab_file" 2>/dev/null; then
-                sed -i '/BEK/d' "$fstab_file"
-                detail "Removed BEK volume entry from fstab"
-            fi
         else
             # Non-LVM fstab fixup: replace root/boot/EFI UUIDs
             local old_root_uuid new_root_uuid old_boot_uuid new_boot_uuid old_efi_uuid new_efi_uuid
@@ -1172,6 +1167,12 @@ fixup_target() {
                 sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
                 detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
             fi
+        fi
+
+        # Remove BEK volume line from fstab (common to LVM and non-LVM)
+        if grep -qi "BEK" "$fstab_file" 2>/dev/null; then
+            sed -i '/BEK/Id' "$fstab_file"
+            detail "Removed BEK volume entry from fstab"
         fi
 
         success "fstab updated"
@@ -1229,6 +1230,8 @@ fixup_target() {
         "$tgt_root/etc/initramfs-tools/hooks/ade"
         "$tgt_root/usr/share/initramfs-tools/hooks/azure_crypt_key"
         "$tgt_root/usr/share/initramfs-tools/hooks/luksheader"
+        "$tgt_root/usr/share/initramfs-tools/hooks/crypt-ade-hook"
+        "$tgt_root/usr/share/initramfs-tools/scripts/init-premount/crypt-ade-boot"
     )
     for hook in "${ade_hooks[@]}"; do
         if [[ -f "$hook" ]]; then
@@ -1292,6 +1295,24 @@ fixup_target() {
         # Remove rd.luks.* and rd.luks.ade.* kernel parameters
         sed -i 's/rd\.luks\.[^ "]*//g' "$grub_defaults"
         sed -i 's/cryptdevice=[^ "]*//g' "$grub_defaults"
+        # Remove root=/dev/mapper/osencrypt or similar crypt root references
+        if ! $USE_LVM; then
+            local new_root_uuid_grub
+            new_root_uuid_grub=$(blkid -o value -s UUID "$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")" 2>/dev/null || true)
+            if [[ -n "$new_root_uuid_grub" ]]; then
+                sed -i "s|root=/dev/mapper/[^ \"]*|root=UUID=${new_root_uuid_grub}|g" "$grub_defaults"
+                detail "Updated root= to UUID=${new_root_uuid_grub}"
+            fi
+        fi
+        # Also fix grub.d overrides (e.g. 50-cloudimg-settings.cfg)
+        for grub_override in "$tgt_root/etc/default/grub.d/"*.cfg; do
+            if [[ -f "$grub_override" ]] && grep -q 'root=/dev/mapper/' "$grub_override" 2>/dev/null; then
+                if ! $USE_LVM && [[ -n "${new_root_uuid_grub:-}" ]]; then
+                    sed -i "s|root=/dev/mapper/[^ \"]*|root=UUID=${new_root_uuid_grub}|g" "$grub_override"
+                    detail "Updated root= in $(basename "$grub_override")"
+                fi
+            fi
+        done
         # Clean up double spaces left behind
         sed -i 's/  */ /g' "$grub_defaults"
         # Add rd.luks=0 and rd.ade=0 to disable encryption in initramfs
@@ -1346,7 +1367,7 @@ fixup_target() {
         chroot "$tgt_root" grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1 || \
             warn "grub2-mkconfig failed — may need manual intervention"
     else
-        chroot "$tgt_root" grub-install "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
+        chroot "$tgt_root" grub-install "/dev/${TARGET_DISK}" --efi-directory=/boot/efi >> "$LOG_FILE" 2>&1 || \
             warn "grub-install failed — may need manual intervention"
         chroot "$tgt_root" update-grub >> "$LOG_FILE" 2>&1 || \
             warn "update-grub failed — may need manual intervention"
