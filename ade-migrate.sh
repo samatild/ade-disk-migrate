@@ -647,6 +647,28 @@ get_partition_dev() {
     fi
 }
 
+sanitize_grub_device_hints() {
+    local grub_file="$1"
+    local label="$2"
+
+    [[ -f "$grub_file" ]] || return 0
+
+    if [[ ! -f "${grub_file}.bak.${TIMESTAMP}" ]]; then
+        cp "$grub_file" "${grub_file}.bak.${TIMESTAMP}"
+    fi
+
+    # GRUB is generated while the target disk is still attached as a secondary
+    # device, so Ubuntu/Debian can bake in transient hdX,gptY hints. Strip
+    # those hints so the promoted OS disk is located purely by filesystem UUID.
+    sed -E -i \
+        -e "/^[[:space:]]*set root='hd[0-9]+,gpt[0-9]+'$/d" \
+        -e "s/[[:space:]]+--hint-[^=[:space:]]+=[^[:space:]]+//g" \
+        -e "s/^(search\.fs_uuid[[:space:]]+[^[:space:]]+[[:space:]]+root)[[:space:]]+[^[:space:]]+/\1/" \
+        "$grub_file"
+
+    detail "Removed transient device hints from ${label}"
+}
+
 copy_bios_boot() {
     local src_part
     src_part=$(get_partition_dev "$SOURCE_DISK" 14)
@@ -1207,11 +1229,19 @@ fixup_target() {
 
     # --- Fix EFI grub.cfg boot UUID reference ---
     info "Updating EFI GRUB config..."
-    local efi_grub_cfg="$tgt_root/boot/efi/EFI/redhat/grub.cfg"
-    if [[ ! -f "$efi_grub_cfg" ]]; then
-        # Try Ubuntu/generic path
-        efi_grub_cfg="$tgt_root/boot/efi/EFI/ubuntu/grub.cfg"
-    fi
+    local efi_grub_cfg=""
+    local efi_grub_candidates=(
+        "$tgt_root/boot/efi/EFI/redhat/grub.cfg"
+        "$tgt_root/boot/efi/EFI/ubuntu/grub.cfg"
+        "$tgt_root/boot/efi/EFI/debian/grub.cfg"
+    )
+    local candidate
+    for candidate in "${efi_grub_candidates[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            efi_grub_cfg="$candidate"
+            break
+        fi
+    done
     if [[ -f "$efi_grub_cfg" ]]; then
         local src_boot_uuid tgt_boot_uuid_efi
         src_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
@@ -1439,6 +1469,23 @@ fixup_target() {
             warn "grub-install failed — may need manual intervention"
         chroot "$tgt_root" update-grub >> "$LOG_FILE" 2>&1 || \
             warn "update-grub failed — may need manual intervention"
+    fi
+
+    if [[ "$DISTRO" != "rhel" ]]; then
+        info "Sanitizing GRUB device hints for portable EFI boot..."
+
+        local target_grub_cfg="$tgt_root/boot/grub/grub.cfg"
+        sanitize_grub_device_hints "$target_grub_cfg" "/boot/grub/grub.cfg"
+
+        local target_efi_grub_candidates=(
+            "$tgt_root/boot/efi/EFI/ubuntu/grub.cfg"
+            "$tgt_root/boot/efi/EFI/debian/grub.cfg"
+        )
+        for candidate in "${target_efi_grub_candidates[@]}"; do
+            if [[ -f "$candidate" ]]; then
+                sanitize_grub_device_hints "$candidate" "$(basename "$(dirname "$candidate")")/grub.cfg"
+            fi
+        done
     fi
 
     success "GRUB bootloader installed"
