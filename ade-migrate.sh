@@ -1112,6 +1112,18 @@ fixup_target() {
         CLEANUP_MOUNTS+=("$tgt_root")
     fi
 
+    # Clean stale /boot from root partition before mounting real boot partition
+    # rsync copies source /boot/ contents (including old grub.cfg with root=/dev/mapper/osencrypt)
+    # to the root partition; these stale files must be removed so they never shadow the real boot
+    if [[ -d "$tgt_root/boot/grub" ]]; then
+        rm -rf "$tgt_root/boot/grub"
+        detail "Cleaned stale /boot/grub from root partition"
+    fi
+    if [[ -d "$tgt_root/boot/efi" ]]; then
+        rm -rf "$tgt_root/boot/efi"
+        detail "Cleaned stale /boot/efi from root partition"
+    fi
+
     # Mount boot inside root
     local tgt_boot_part
     tgt_boot_part=$(get_partition_dev "$TARGET_DISK" "$BOOT_PART_NUM")
@@ -1281,22 +1293,52 @@ fixup_target() {
                 detail "Removed script: $(basename "$script")"
             fi
         done
-        # Restore original cryptroot hook if ADE modified it
-        local cryptroot_hook="$tgt_root/usr/share/initramfs-tools/hooks/cryptroot"
-        if [[ -f "${cryptroot_hook}.orig" ]]; then
-            cp "${cryptroot_hook}.orig" "$cryptroot_hook"
-            detail "Restored original cryptroot hook"
-        fi
+        # Remove standard cryptroot hooks and scripts (from cryptsetup-initramfs package)
+        # These are NOT ADE-specific but will embed cryptsetup into initramfs if present
+        local stock_crypto_hooks=(
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptroot"
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptroot-unlock"
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptgnupg"
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptgnupg-sc"
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptopensc"
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptpassdev"
+            "$tgt_root/usr/share/initramfs-tools/hooks/cryptkeyctl"
+        )
+        for hook in "${stock_crypto_hooks[@]}"; do
+            if [[ -f "$hook" ]]; then
+                rm -f "$hook"
+                detail "Removed stock crypto hook: $(basename "$hook")"
+            fi
+        done
+        local stock_crypto_scripts=(
+            "$tgt_root/usr/share/initramfs-tools/scripts/local-top/cryptroot"
+            "$tgt_root/usr/share/initramfs-tools/scripts/local-block/cryptroot"
+            "$tgt_root/usr/share/initramfs-tools/scripts/local-bottom/cryptroot"
+            "$tgt_root/usr/share/initramfs-tools/scripts/local-top/cryptopensc"
+            "$tgt_root/usr/share/initramfs-tools/scripts/local-bottom/cryptopensc"
+            "$tgt_root/usr/share/initramfs-tools/scripts/local-bottom/cryptgnupg-sc"
+        )
+        for script in "${stock_crypto_scripts[@]}"; do
+            if [[ -f "$script" ]]; then
+                rm -f "$script"
+                detail "Removed stock crypto script: $(basename "$(dirname "$script")")/$(basename "$script")"
+            fi
+        done
         # Remove cryptroot initramfs config
         if [[ -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot" ]]; then
             rm -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot"
             detail "Removed initramfs cryptroot config"
         fi
-        # Disable cryptsetup in initramfs
+        # Disable cryptsetup in initramfs conf-hook
         if [[ -f "$tgt_root/etc/cryptsetup-initramfs/conf-hook" ]]; then
             cp "$tgt_root/etc/cryptsetup-initramfs/conf-hook" \
                "$tgt_root/etc/cryptsetup-initramfs/conf-hook.bak.${TIMESTAMP}"
-            sed -i 's/^CRYPTSETUP=.*/CRYPTSETUP=n/' "$tgt_root/etc/cryptsetup-initramfs/conf-hook"
+            # Append CRYPTSETUP=n (sed replace won't work if the line is commented or absent)
+            if grep -q '^CRYPTSETUP=' "$tgt_root/etc/cryptsetup-initramfs/conf-hook"; then
+                sed -i 's/^CRYPTSETUP=.*/CRYPTSETUP=n/' "$tgt_root/etc/cryptsetup-initramfs/conf-hook"
+            else
+                echo 'CRYPTSETUP=n' >> "$tgt_root/etc/cryptsetup-initramfs/conf-hook"
+            fi
             detail "Set CRYPTSETUP=n in initramfs conf-hook"
         fi
     fi
