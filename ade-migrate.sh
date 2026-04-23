@@ -1218,62 +1218,75 @@ fixup_target() {
 
     # --- Remove Azure Disk Encryption artifacts ---
     info "Removing Azure Disk Encryption artifacts..."
-    # ADE key script
+
+    # Common ADE artifacts (both distros)
     if [[ -f "$tgt_root/usr/sbin/azure_crypt_key.sh" ]]; then
         rm -f "$tgt_root/usr/sbin/azure_crypt_key.sh"
         detail "Removed azure_crypt_key.sh"
     fi
-
-    # Ubuntu-specific ADE hooks (initramfs-tools)
-    local ade_hooks=(
-        "$tgt_root/etc/initramfs-tools/hooks/azure_crypt_key"
-        "$tgt_root/etc/initramfs-tools/hooks/ade"
-        "$tgt_root/usr/share/initramfs-tools/hooks/azure_crypt_key"
-        "$tgt_root/usr/share/initramfs-tools/hooks/luksheader"
-        "$tgt_root/usr/share/initramfs-tools/hooks/crypt-ade-hook"
-        "$tgt_root/usr/share/initramfs-tools/scripts/init-premount/crypt-ade-boot"
-    )
-    for hook in "${ade_hooks[@]}"; do
-        if [[ -f "$hook" ]]; then
-            rm -f "$hook"
-            detail "Removed hook: $(basename "$hook")"
-        fi
-    done
-    local cryptroot_hook="$tgt_root/usr/share/initramfs-tools/hooks/cryptroot"
-    if [[ -f "${cryptroot_hook}.orig" ]]; then
-        cp "${cryptroot_hook}.orig" "$cryptroot_hook"
-        detail "Restored original cryptroot hook"
-    fi
-    if [[ -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot" ]]; then
-        rm -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot"
-        detail "Removed initramfs cryptroot config"
-    fi
-    if [[ -f "$tgt_root/etc/cryptsetup-initramfs/conf-hook" ]]; then
-        cp "$tgt_root/etc/cryptsetup-initramfs/conf-hook" \
-           "$tgt_root/etc/cryptsetup-initramfs/conf-hook.bak.${TIMESTAMP}"
-        sed -i 's/^CRYPTSETUP=.*/CRYPTSETUP=n/' "$tgt_root/etc/cryptsetup-initramfs/conf-hook"
-        detail "Set CRYPTSETUP=n in initramfs conf-hook"
-    fi
-
-    # RHEL-specific ADE artifacts (dracut)
-    if [[ -d "$tgt_root/usr/lib/dracut/modules.d/91adeOnline" ]]; then
-        rm -rf "$tgt_root/usr/lib/dracut/modules.d/91adeOnline"
-        detail "Removed dracut module 91adeOnline"
-    fi
-    if [[ -f "$tgt_root/etc/dracut.conf.d/ade.conf" ]]; then
-        rm -f "$tgt_root/etc/dracut.conf.d/ade.conf"
-        detail "Removed /etc/dracut.conf.d/ade.conf"
-    fi
-    # Remove ADE-specific binaries from target
     if [[ -f "$tgt_root/usr/sbin/crypt-run-generator-ade" ]]; then
         rm -f "$tgt_root/usr/sbin/crypt-run-generator-ade"
         detail "Removed crypt-run-generator-ade binary"
     fi
-    # Create dracut config to permanently exclude crypt/ADE modules
-    mkdir -p "$tgt_root/etc/dracut.conf.d"
-    echo 'omit_dracutmodules+=" crypt crypt-gpg crypt-loop adeOnline "' \
-        > "$tgt_root/etc/dracut.conf.d/99-no-crypt.conf"
-    detail "Created /etc/dracut.conf.d/99-no-crypt.conf to exclude crypt modules"
+
+    if [[ "$DISTRO" == "rhel" ]]; then
+        # ── RHEL-specific ADE artifacts (dracut) ──
+        if [[ -d "$tgt_root/usr/lib/dracut/modules.d/91adeOnline" ]]; then
+            rm -rf "$tgt_root/usr/lib/dracut/modules.d/91adeOnline"
+            detail "Removed dracut module 91adeOnline"
+        fi
+        if [[ -f "$tgt_root/etc/dracut.conf.d/ade.conf" ]]; then
+            rm -f "$tgt_root/etc/dracut.conf.d/ade.conf"
+            detail "Removed /etc/dracut.conf.d/ade.conf"
+        fi
+        mkdir -p "$tgt_root/etc/dracut.conf.d"
+        echo 'omit_dracutmodules+=" crypt crypt-gpg crypt-loop adeOnline "' \
+            > "$tgt_root/etc/dracut.conf.d/99-no-crypt.conf"
+        detail "Created /etc/dracut.conf.d/99-no-crypt.conf to exclude crypt modules"
+    else
+        # ── Ubuntu/Debian-specific ADE artifacts (initramfs-tools) ──
+        local ade_hooks=(
+            "$tgt_root/etc/initramfs-tools/hooks/azure_crypt_key"
+            "$tgt_root/etc/initramfs-tools/hooks/ade"
+            "$tgt_root/usr/share/initramfs-tools/hooks/azure_crypt_key"
+            "$tgt_root/usr/share/initramfs-tools/hooks/luksheader"
+            "$tgt_root/usr/share/initramfs-tools/hooks/crypt-ade-hook"
+        )
+        for hook in "${ade_hooks[@]}"; do
+            if [[ -f "$hook" ]]; then
+                rm -f "$hook"
+                detail "Removed hook: $(basename "$hook")"
+            fi
+        done
+        # Remove ADE init-premount/boot scripts (these run mount -a + cryptsetup)
+        local ade_scripts=(
+            "$tgt_root/usr/share/initramfs-tools/scripts/init-premount/crypt-ade-boot"
+        )
+        for script in "${ade_scripts[@]}"; do
+            if [[ -f "$script" ]]; then
+                rm -f "$script"
+                detail "Removed script: $(basename "$script")"
+            fi
+        done
+        # Restore original cryptroot hook if ADE modified it
+        local cryptroot_hook="$tgt_root/usr/share/initramfs-tools/hooks/cryptroot"
+        if [[ -f "${cryptroot_hook}.orig" ]]; then
+            cp "${cryptroot_hook}.orig" "$cryptroot_hook"
+            detail "Restored original cryptroot hook"
+        fi
+        # Remove cryptroot initramfs config
+        if [[ -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot" ]]; then
+            rm -f "$tgt_root/etc/initramfs-tools/conf.d/cryptroot"
+            detail "Removed initramfs cryptroot config"
+        fi
+        # Disable cryptsetup in initramfs
+        if [[ -f "$tgt_root/etc/cryptsetup-initramfs/conf-hook" ]]; then
+            cp "$tgt_root/etc/cryptsetup-initramfs/conf-hook" \
+               "$tgt_root/etc/cryptsetup-initramfs/conf-hook.bak.${TIMESTAMP}"
+            sed -i 's/^CRYPTSETUP=.*/CRYPTSETUP=n/' "$tgt_root/etc/cryptsetup-initramfs/conf-hook"
+            detail "Set CRYPTSETUP=n in initramfs conf-hook"
+        fi
+    fi
 
     # --- Reinstall GRUB ---
     info "Reinstalling GRUB bootloader on target..."
