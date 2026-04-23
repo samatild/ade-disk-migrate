@@ -733,19 +733,32 @@ copy_boot_partition() {
     local src_fstype
     src_fstype=$(blkid -o value -s TYPE "$src_part" 2>/dev/null || echo "ext2")
 
+    # Preserve filesystem label from source (fstab may reference LABEL=BOOT)
+    local src_label
+    src_label=$(blkid -o value -s LABEL "$src_part" 2>/dev/null || true)
+
     info "Creating ${src_fstype} filesystem on /boot partition..."
     if $DRY_RUN; then
         detail "[DRY RUN] mkfs.${src_fstype} ${tgt_part} + rsync"
         return
     fi
 
+    local label_opt=""
+    if [[ -n "$src_label" ]]; then
+        label_opt="-L $src_label"
+    fi
+
     case "$src_fstype" in
-        ext2) mkfs.ext2 -q "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
-        ext3) mkfs.ext3 -q "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
-        ext4) mkfs.ext4 -q "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
-        xfs)  mkfs.xfs -f "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
+        ext2) mkfs.ext2 -q $label_opt "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
+        ext3) mkfs.ext3 -q $label_opt "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
+        ext4) mkfs.ext4 -q $label_opt "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
+        xfs)  mkfs.xfs -f ${src_label:+-L "$src_label"} "$tgt_part" >> "$LOG_FILE" 2>&1 ;;
         *) die "Unsupported /boot filesystem: $src_fstype" ;;
     esac
+
+    if [[ -n "$src_label" ]]; then
+        detail "Preserved label: ${src_label}"
+    fi
 
     # Use existing mountpoint if already mounted, otherwise mount temporarily
     local src_mnt
