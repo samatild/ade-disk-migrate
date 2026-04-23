@@ -350,6 +350,15 @@ detect_os_disk() {
                 local slave_dev
                 slave_dev=$(find "$slaves_dir" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | head -1)
                 if [[ -n "$slave_dev" ]]; then
+                    # Walk through DM chain until we reach a physical device
+                    while [[ "$slave_dev" == dm-* ]]; do
+                        detail "Encrypted partition: /dev/${slave_dev}"
+                        local next_slaves="/sys/class/block/${slave_dev}/slaves"
+                        if [[ ! -d "$next_slaves" ]] || [[ -z "$(ls -A "$next_slaves" 2>/dev/null)" ]]; then
+                            break
+                        fi
+                        slave_dev=$(ls "$next_slaves" 2>/dev/null | head -1)
+                    done
                     detail "Encrypted partition: /dev/${slave_dev}"
                     SOURCE_DISK=$(lsblk -n -o PKNAME "/dev/${slave_dev}" 2>/dev/null | head -1)
                 fi
