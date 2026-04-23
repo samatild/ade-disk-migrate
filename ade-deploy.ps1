@@ -131,9 +131,23 @@ function Invoke-VMScript {
         -CommandId 'RunShellScript' `
         -ScriptString $Script
 
-    $stdout = if ($result.Value -and $result.Value.Count -gt 0) { $result.Value[0].Message } else { "" }
-    $stderr = if ($result.Value -and $result.Value.Count -gt 1) { $result.Value[1].Message } else { "" }
-    return @{ Stdout = $stdout; Stderr = $stderr }
+    $rawOutput = if ($result.Value) {
+        (($result.Value | ForEach-Object { $_.Message }) -join "`n").Trim()
+    } else {
+        ""
+    }
+
+    $stdout = ""
+    $stderr = ""
+
+    if ($rawOutput -match '(?s)\[stdout\]\s*(.*?)\s*\[stderr\]\s*(.*)$') {
+        $stdout = $Matches[1].Trim()
+        $stderr = $Matches[2].Trim()
+    } else {
+        $stdout = $rawOutput
+    }
+
+    return @{ Stdout = $stdout; Stderr = $stderr; Raw = $rawOutput }
 }
 
 #endregion
@@ -321,8 +335,9 @@ try {
     # Upload script via base64 to avoid escaping issues
     $scriptBytes = [System.IO.File]::ReadAllBytes($migrateScript)
     $b64 = [Convert]::ToBase64String($scriptBytes)
+    $remoteScriptPath = '/root/ade-migrate.sh'
 
-    $uploadCmd = "echo '$b64' | base64 -d > /tmp/ade-migrate.sh && chmod +x /tmp/ade-migrate.sh && echo UPLOAD_OK"
+    $uploadCmd = "umask 022 && echo '$b64' | base64 -d > $remoteScriptPath && chmod 700 $remoteScriptPath && echo UPLOAD_OK"
 
     $upload = Invoke-VMScript -RG $ResourceGroupName -VM $VMName `
         -Script $uploadCmd `
@@ -330,7 +345,11 @@ try {
 
     if ($upload.Stdout -notmatch 'UPLOAD_OK') {
         Write-Err "Script upload failed"
-        if ($upload.Stderr) { Write-Detail $upload.Stderr }
+        if ($upload.Stderr) {
+            Write-Detail $upload.Stderr
+        } elseif ($upload.Raw) {
+            Write-Detail $upload.Raw
+        }
         exit 1
     }
     Write-OK "ade-migrate.sh uploaded"
@@ -340,7 +359,7 @@ try {
     Write-Detail "Run Command timeout: ~90 min. For disks >500 GB, run manually."
     Write-Host ""
 
-    $runCmd = 'bash /tmp/ade-migrate.sh --yes 2>&1; echo "###MIGRATE_EXIT=$?###"'
+    $runCmd = "bash $remoteScriptPath --yes 2>&1; echo `"###MIGRATE_EXIT=`$?###`""
 
     $run = Invoke-VMScript -RG $ResourceGroupName -VM $VMName `
         -Script $runCmd `
