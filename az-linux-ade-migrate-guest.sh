@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ###############################################################################
-# ade-migrate.sh — Azure Linux Encrypted OS Disk Migration
+# az-linux-ade-migrate-guest.sh — Azure Linux Encrypted OS Disk Migration
 #
 # Copyright (c) 2026 Samuel Matildes. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
@@ -196,12 +196,20 @@ check_dependencies() {
 
 cleanup() {
     log "INFO" "Running cleanup..."
-    for mnt in "${CLEANUP_MOUNTS[@]}"; do
+    sync 2>/dev/null || true
+    local idx
+    local mnt
+    for (( idx=${#CLEANUP_MOUNTS[@]}-1; idx>=0; idx-- )); do
+        mnt="${CLEANUP_MOUNTS[$idx]}"
         if mountpoint -q "$mnt" 2>/dev/null; then
-            umount "$mnt" 2>/dev/null || true
-            log "INFO" "Unmounted $mnt"
+            if umount "$mnt" 2>/dev/null; then
+                log "INFO" "Unmounted $mnt"
+            else
+                log "WARN" "Failed to unmount $mnt during cleanup"
+            fi
         fi
     done
+    sync 2>/dev/null || true
     # Remove temp mount dirs (only top-level /tmp/azmigrate_* dirs, not subdirs)
     for mnt in "${CLEANUP_MOUNTS[@]}"; do
         if [[ -d "$mnt" ]] && [[ "$mnt" == /tmp/azmigrate_* ]] && [[ "$(dirname "$mnt")" == "/tmp" ]]; then
@@ -658,15 +666,76 @@ sanitize_grub_device_hints() {
     fi
 
     # GRUB is generated while the target disk is still attached as a secondary
-    # device, so Ubuntu/Debian can bake in transient hdX,gptY hints. Strip
-    # those hints so the promoted OS disk is located purely by filesystem UUID.
+    # device, so distro-specific configs can bake in transient hdX,gptY hints.
+    # Strip those hints so the promoted OS disk is located purely by filesystem UUID.
     sed -E -i \
-        -e "/^[[:space:]]*set root='hd[0-9]+,gpt[0-9]+'$/d" \
+        -e "/^[[:space:]]*set (root|boot)='hd[0-9]+,gpt[0-9]+'$/d" \
         -e "s/[[:space:]]+--hint-[^=[:space:]]+=[^[:space:]]+//g" \
         -e "s/^(search\.fs_uuid[[:space:]]+[^[:space:]]+[[:space:]]+root)[[:space:]]+[^[:space:]]+/\1/" \
         "$grub_file"
 
     detail "Removed transient device hints from ${label}"
+}
+
+grub_cfg_has_boot_entries() {
+    local grub_file="$1"
+
+    [[ -f "$grub_file" ]] || return 1
+
+    if grep -Eq '^[[:space:]]*menuentry ' "$grub_file"; then
+        return 0
+    fi
+
+    if grep -Eq '^[[:space:]]*(insmod[[:space:]]+blscfg|blscfg)([[:space:]]|$)' "$grub_file"; then
+        return 0
+    fi
+
+    return 1
+}
+
+stamp_grub_debug_metadata() {
+    local grub_file="$1"
+    local root_uuid="$2"
+    local boot_uuid="$3"
+    local efi_uuid="$4"
+
+    [[ -f "$grub_file" ]] || return 0
+
+    local tmp_file
+    tmp_file=$(mktemp)
+    {
+        printf '# azmigrate_run_id=%s\n' "$TIMESTAMP"
+        printf '# azmigrate_log_file=%s\n' "$LOG_FILE"
+        printf '# azmigrate_source_disk=/dev/%s\n' "$SOURCE_DISK"
+        printf '# azmigrate_target_disk=/dev/%s\n' "$TARGET_DISK"
+        printf '# azmigrate_root_uuid=%s\n' "${root_uuid:-n/a}"
+        printf '# azmigrate_boot_uuid=%s\n' "${boot_uuid:-n/a}"
+        printf '# azmigrate_efi_uuid=%s\n' "${efi_uuid:-n/a}"
+        cat "$grub_file"
+    } > "$tmp_file"
+    mv "$tmp_file" "$grub_file"
+}
+
+write_debug_fingerprint() {
+    local tgt_root="$1"
+    local root_uuid="$2"
+    local boot_uuid="$3"
+    local efi_uuid="$4"
+    local fingerprint_file="$tgt_root/etc/azmigrate-debug.env"
+
+    cat > "$fingerprint_file" <<EOF
+AZMIGRATE_RUN_ID=${TIMESTAMP}
+AZMIGRATE_VERSION=${VERSION}
+AZMIGRATE_LOG_FILE=${LOG_FILE}
+AZMIGRATE_SOURCE_DISK=/dev/${SOURCE_DISK}
+AZMIGRATE_TARGET_DISK=/dev/${TARGET_DISK}
+AZMIGRATE_USE_LVM=${USE_LVM}
+AZMIGRATE_ROOT_UUID=${root_uuid:-n/a}
+AZMIGRATE_BOOT_UUID=${boot_uuid:-n/a}
+AZMIGRATE_EFI_UUID=${efi_uuid:-n/a}
+EOF
+
+    detail "Wrote debug fingerprint: /etc/azmigrate-debug.env"
 }
 
 copy_bios_boot() {
@@ -1120,6 +1189,12 @@ fixup_target() {
     fi
 
     local tgt_root="/tmp/azmigrate_root_tgt_${TIMESTAMP}"
+    local source_root_uuid=""
+    local target_root_uuid=""
+    local source_boot_uuid=""
+    local target_boot_uuid=""
+    local source_efi_uuid=""
+    local target_efi_uuid=""
 
     # --- Mount target root if not already mounted ---
     if ! mountpoint -q "$tgt_root" 2>/dev/null; then
@@ -1176,43 +1251,41 @@ fixup_target() {
             # LVM fstab fixup:
             # VG name is already correct (target created with original name)
             # Just update boot and EFI UUIDs
-            local old_boot_uuid new_boot_uuid old_efi_uuid new_efi_uuid
-            old_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
-            new_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
-            old_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
-            new_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
+            source_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+            target_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
+            source_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
+            target_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
 
-            if [[ -n "$old_boot_uuid" ]] && [[ -n "$new_boot_uuid" ]]; then
-                sed -i "s/${old_boot_uuid}/${new_boot_uuid}/g" "$fstab_file"
-                detail "Boot UUID: ${old_boot_uuid} ${ARROW} ${new_boot_uuid}"
+            if [[ -n "$source_boot_uuid" ]] && [[ -n "$target_boot_uuid" ]]; then
+                sed -i "s/${source_boot_uuid}/${target_boot_uuid}/g" "$fstab_file"
+                detail "Boot UUID: ${source_boot_uuid} ${ARROW} ${target_boot_uuid}"
             fi
-            if [[ -n "$old_efi_uuid" ]] && [[ -n "$new_efi_uuid" ]]; then
-                sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
-                detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
+            if [[ -n "$source_efi_uuid" ]] && [[ -n "$target_efi_uuid" ]]; then
+                sed -i "s/${source_efi_uuid}/${target_efi_uuid}/g" "$fstab_file"
+                detail "EFI UUID:  ${source_efi_uuid} ${ARROW} ${target_efi_uuid}"
             fi
         else
             # Non-LVM fstab fixup: replace root/boot/EFI UUIDs
-            local old_root_uuid new_root_uuid old_boot_uuid new_boot_uuid old_efi_uuid new_efi_uuid
             local tgt_root_part
             tgt_root_part=$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")
-            old_root_uuid=$(blkid -o value -s UUID "/dev/mapper/${DM_NAME}" 2>/dev/null || true)
-            new_root_uuid=$(blkid -o value -s UUID "$tgt_root_part" 2>/dev/null || true)
-            old_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
-            new_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
-            old_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
-            new_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
+            source_root_uuid=$(blkid -o value -s UUID "/dev/mapper/${DM_NAME}" 2>/dev/null || true)
+            target_root_uuid=$(blkid -o value -s UUID "$tgt_root_part" 2>/dev/null || true)
+            source_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+            target_boot_uuid=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
+            source_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
+            target_efi_uuid=$(blkid -o value -s UUID "$tgt_efi_part" 2>/dev/null || true)
 
-            if [[ -n "$old_root_uuid" ]] && [[ -n "$new_root_uuid" ]]; then
-                sed -i "s/${old_root_uuid}/${new_root_uuid}/g" "$fstab_file"
-                detail "Root UUID: ${old_root_uuid} ${ARROW} ${new_root_uuid}"
+            if [[ -n "$source_root_uuid" ]] && [[ -n "$target_root_uuid" ]]; then
+                sed -i "s/${source_root_uuid}/${target_root_uuid}/g" "$fstab_file"
+                detail "Root UUID: ${source_root_uuid} ${ARROW} ${target_root_uuid}"
             fi
-            if [[ -n "$old_boot_uuid" ]] && [[ -n "$new_boot_uuid" ]]; then
-                sed -i "s/${old_boot_uuid}/${new_boot_uuid}/g" "$fstab_file"
-                detail "Boot UUID: ${old_boot_uuid} ${ARROW} ${new_boot_uuid}"
+            if [[ -n "$source_boot_uuid" ]] && [[ -n "$target_boot_uuid" ]]; then
+                sed -i "s/${source_boot_uuid}/${target_boot_uuid}/g" "$fstab_file"
+                detail "Boot UUID: ${source_boot_uuid} ${ARROW} ${target_boot_uuid}"
             fi
-            if [[ -n "$old_efi_uuid" ]] && [[ -n "$new_efi_uuid" ]]; then
-                sed -i "s/${old_efi_uuid}/${new_efi_uuid}/g" "$fstab_file"
-                detail "EFI UUID:  ${old_efi_uuid} ${ARROW} ${new_efi_uuid}"
+            if [[ -n "$source_efi_uuid" ]] && [[ -n "$target_efi_uuid" ]]; then
+                sed -i "s/${source_efi_uuid}/${target_efi_uuid}/g" "$fstab_file"
+                detail "EFI UUID:  ${source_efi_uuid} ${ARROW} ${target_efi_uuid}"
             fi
         fi
 
@@ -1243,13 +1316,10 @@ fixup_target() {
         fi
     done
     if [[ -f "$efi_grub_cfg" ]]; then
-        local src_boot_uuid tgt_boot_uuid_efi
-        src_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
-        tgt_boot_uuid_efi=$(blkid -o value -s UUID "$tgt_boot_part" 2>/dev/null || true)
-        if [[ -n "$src_boot_uuid" ]] && [[ -n "$tgt_boot_uuid_efi" ]] && [[ "$src_boot_uuid" != "$tgt_boot_uuid_efi" ]]; then
+        if [[ -n "$source_boot_uuid" ]] && [[ -n "$target_boot_uuid" ]] && [[ "$source_boot_uuid" != "$target_boot_uuid" ]]; then
             cp "$efi_grub_cfg" "${efi_grub_cfg}.bak.${TIMESTAMP}"
-            sed -i "s/${src_boot_uuid}/${tgt_boot_uuid_efi}/g" "$efi_grub_cfg"
-            detail "EFI grub.cfg: boot UUID ${src_boot_uuid} ${ARROW} ${tgt_boot_uuid_efi}"
+            sed -i "s/${source_boot_uuid}/${target_boot_uuid}/g" "$efi_grub_cfg"
+            detail "EFI grub.cfg: boot UUID ${source_boot_uuid} ${ARROW} ${target_boot_uuid}"
         else
             detail "EFI grub.cfg: boot UUID unchanged"
         fi
@@ -1393,10 +1463,11 @@ fixup_target() {
         # Remove rd.luks.* and rd.luks.ade.* kernel parameters
         sed -i 's/rd\.luks\.[^ "]*//g' "$grub_defaults"
         sed -i 's/cryptdevice=[^ "]*//g' "$grub_defaults"
+        sed -E -i 's/azmigrate_(run|root_uuid|boot_uuid|efi_uuid)=[^ "]*//g' "$grub_defaults"
         # Remove root=/dev/mapper/osencrypt or similar crypt root references
         if ! $USE_LVM; then
             local new_root_uuid_grub
-            new_root_uuid_grub=$(blkid -o value -s UUID "$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")" 2>/dev/null || true)
+            new_root_uuid_grub="$target_root_uuid"
             if [[ -n "$new_root_uuid_grub" ]]; then
                 sed -i "s|root=/dev/mapper/[^ \"]*|root=UUID=${new_root_uuid_grub}|g" "$grub_defaults"
                 detail "Updated root= to UUID=${new_root_uuid_grub}"
@@ -1418,6 +1489,18 @@ fixup_target() {
             sed -i 's/^\(GRUB_CMDLINE_LINUX=\"\)/\1rd.luks=0 rd.ade=0 /' "$grub_defaults"
             detail "Added rd.luks=0 rd.ade=0 to kernel command line"
         fi
+        local debug_cmdline="azmigrate_run=${TIMESTAMP}"
+        if [[ -n "$target_root_uuid" ]]; then
+            debug_cmdline+=" azmigrate_root_uuid=${target_root_uuid}"
+        fi
+        if [[ -n "$target_boot_uuid" ]]; then
+            debug_cmdline+=" azmigrate_boot_uuid=${target_boot_uuid}"
+        fi
+        if [[ -n "$target_efi_uuid" ]]; then
+            debug_cmdline+=" azmigrate_efi_uuid=${target_efi_uuid}"
+        fi
+        sed -i "s/^\(GRUB_CMDLINE_LINUX=\"\)/\1${debug_cmdline} /" "$grub_defaults"
+        detail "Added azmigrate fingerprint to kernel command line"
         # Disable os-prober to prevent detecting source OS and creating duplicate entries
         if ! grep -q 'GRUB_DISABLE_OS_PROBER' "$grub_defaults"; then
             echo 'GRUB_DISABLE_OS_PROBER=true' >> "$grub_defaults"
@@ -1459,34 +1542,61 @@ fixup_target() {
     fi
 
     # Install GRUB bootloader
+    local target_grub_cfg=""
     if [[ "$DISTRO" == "rhel" ]]; then
+        target_grub_cfg="$tgt_root/boot/grub2/grub.cfg"
         chroot "$tgt_root" grub2-install "/dev/${TARGET_DISK}" >> "$LOG_FILE" 2>&1 || \
             warn "grub2-install failed — may need manual intervention"
         chroot "$tgt_root" grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1 || \
             warn "grub2-mkconfig failed — may need manual intervention"
     else
+        target_grub_cfg="$tgt_root/boot/grub/grub.cfg"
         chroot "$tgt_root" grub-install "/dev/${TARGET_DISK}" --efi-directory=/boot/efi >> "$LOG_FILE" 2>&1 || \
             warn "grub-install failed — may need manual intervention"
         chroot "$tgt_root" update-grub >> "$LOG_FILE" 2>&1 || \
             warn "update-grub failed — may need manual intervention"
+        if [[ ! -s "$target_grub_cfg" ]]; then
+            warn "/boot/grub/grub.cfg is empty after update-grub — retrying grub-mkconfig directly"
+            chroot "$tgt_root" grub-mkconfig -o /boot/grub/grub.cfg >> "$LOG_FILE" 2>&1 || \
+                warn "Direct grub-mkconfig retry failed — may need manual intervention"
+        fi
     fi
 
-    if [[ "$DISTRO" != "rhel" ]]; then
-        info "Sanitizing GRUB device hints for portable EFI boot..."
+    local target_grub_label="${target_grub_cfg#"$tgt_root"}"
+    [[ "$target_grub_label" == "$target_grub_cfg" ]] && target_grub_label="$target_grub_cfg"
+    if [[ ! -s "$target_grub_cfg" ]]; then
+        die "Failed to generate non-empty ${target_grub_label}"
+    fi
+    if ! grub_cfg_has_boot_entries "$target_grub_cfg"; then
+        die "Generated ${target_grub_label} contains no boot entries"
+    fi
 
-        local target_grub_cfg="$tgt_root/boot/grub/grub.cfg"
-        sanitize_grub_device_hints "$target_grub_cfg" "/boot/grub/grub.cfg"
+    info "Sanitizing GRUB device hints for portable EFI boot..."
 
-        local target_efi_grub_candidates=(
+    sanitize_grub_device_hints "$target_grub_cfg" "$target_grub_label"
+    stamp_grub_debug_metadata "$target_grub_cfg" "$target_root_uuid" "$target_boot_uuid" "$target_efi_uuid"
+    if [[ ! -s "$target_grub_cfg" ]]; then
+        die "${target_grub_label} became empty after sanitizing/stamping"
+    fi
+
+    local target_efi_grub_candidates=()
+    if [[ "$DISTRO" == "rhel" ]]; then
+        target_efi_grub_candidates+=("$tgt_root/boot/efi/EFI/redhat/grub.cfg")
+    else
+        target_efi_grub_candidates+=(
             "$tgt_root/boot/efi/EFI/ubuntu/grub.cfg"
             "$tgt_root/boot/efi/EFI/debian/grub.cfg"
         )
-        for candidate in "${target_efi_grub_candidates[@]}"; do
-            if [[ -f "$candidate" ]]; then
-                sanitize_grub_device_hints "$candidate" "$(basename "$(dirname "$candidate")")/grub.cfg"
-            fi
-        done
     fi
+    for candidate in "${target_efi_grub_candidates[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            sanitize_grub_device_hints "$candidate" "$(basename "$(dirname "$candidate")")/grub.cfg"
+            stamp_grub_debug_metadata "$candidate" "$target_root_uuid" "$target_boot_uuid" "$target_efi_uuid"
+        fi
+    done
+
+    write_debug_fingerprint "$tgt_root" "$target_root_uuid" "$target_boot_uuid" "$target_efi_uuid"
+    sync 2>/dev/null || true
 
     success "GRUB bootloader installed"
 
@@ -1524,6 +1634,21 @@ verify_target() {
         CLEANUP_MOUNTS+=("$tgt_root")
     fi
 
+    local source_root_uuid=""
+    local source_boot_uuid=""
+    local source_efi_uuid=""
+    local target_root_uuid=""
+    local target_boot_uuid=""
+    local target_efi_uuid=""
+    if ! $USE_LVM; then
+        source_root_uuid=$(blkid -o value -s UUID "/dev/mapper/${DM_NAME}" 2>/dev/null || true)
+        target_root_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$TARGET_DISK" "$DATA_PART_NUM")" 2>/dev/null || true)
+    fi
+    source_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+    source_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$SOURCE_DISK" 15)" 2>/dev/null || true)
+    target_boot_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$TARGET_DISK" "$BOOT_PART_NUM")" 2>/dev/null || true)
+    target_efi_uuid=$(blkid -o value -s UUID "$(get_partition_dev "$TARGET_DISK" 15)" 2>/dev/null || true)
+
     # Check fstab exists
     if [[ -f "$tgt_root/etc/fstab" ]]; then
         success "fstab present on target"
@@ -1533,6 +1658,72 @@ verify_target() {
         done
     else
         warn "fstab missing from target"
+    fi
+
+    local boot_cfg
+    local boot_cfg_label
+    if [[ "$DISTRO" == "rhel" ]]; then
+        boot_cfg="$tgt_root/boot/grub2/grub.cfg"
+        boot_cfg_label="/boot/grub2/grub.cfg"
+    else
+        boot_cfg="$tgt_root/boot/grub/grub.cfg"
+        boot_cfg_label="/boot/grub/grub.cfg"
+    fi
+    local stale_refs=()
+    local joined_refs=""
+    local ref
+    [[ -n "$DM_NAME" ]] && stale_refs+=("/dev/mapper/${DM_NAME}")
+    [[ -n "$source_root_uuid" ]] && stale_refs+=("$source_root_uuid")
+    [[ -n "$source_boot_uuid" ]] && stale_refs+=("$source_boot_uuid")
+    [[ -n "$source_efi_uuid" ]] && stale_refs+=("$source_efi_uuid")
+    stale_refs+=("osencrypt")
+
+    for ref in "${stale_refs[@]}"; do
+        [[ -n "$joined_refs" ]] && joined_refs+="|"
+        joined_refs+="$ref"
+    done
+
+    if [[ -f "$boot_cfg" ]]; then
+        if [[ ! -s "$boot_cfg" ]]; then
+            die "${boot_cfg_label} is empty on target"
+        fi
+        if ! grub_cfg_has_boot_entries "$boot_cfg"; then
+            die "${boot_cfg_label} contains no boot entries on target"
+        fi
+        if [[ -n "$joined_refs" ]]; then
+            if grep -Eq "$joined_refs" "$boot_cfg"; then
+                grep -En "$joined_refs" "$boot_cfg" | while IFS= read -r line; do
+                    detail "Stale ${boot_cfg_label} ref: $line"
+                done
+                die "Stale encrypted-root references remain in ${boot_cfg_label}"
+            fi
+        fi
+    else
+        die "${boot_cfg_label} is missing on target"
+    fi
+
+    local efi_cfg
+    for efi_cfg in \
+        "$tgt_root/boot/efi/EFI/ubuntu/grub.cfg" \
+        "$tgt_root/boot/efi/EFI/debian/grub.cfg" \
+        "$tgt_root/boot/efi/EFI/redhat/grub.cfg"; do
+        [[ -f "$efi_cfg" ]] || continue
+        if [[ -n "$joined_refs" ]] && grep -Eq "$joined_refs" "$efi_cfg"; then
+            grep -En "$joined_refs" "$efi_cfg" | while IFS= read -r line; do
+                detail "Stale EFI grub ref: $line"
+            done
+            die "Stale encrypted-root references remain in $(basename "$(dirname "$efi_cfg")")/grub.cfg"
+        fi
+    done
+
+    local debug_file="$tgt_root/etc/azmigrate-debug.env"
+    if [[ -f "$debug_file" ]]; then
+        info "Target debug fingerprint:"
+        while IFS= read -r line; do
+            detail "$line"
+        done < "$debug_file"
+    else
+        warn "Debug fingerprint missing from target"
     fi
 
     # Verify partition UUIDs
@@ -1618,6 +1809,7 @@ print_final_report() {
     echo "ROOT_UUID=${tgt_root_uuid}"
     echo "BOOT_UUID=${tgt_boot_uuid}"
     echo "EFI_UUID=${tgt_efi_uuid}"
+    echo "RUN_ID=${TIMESTAMP}"
     echo "ROOT_FS=${ROOT_FSTYPE}"
     echo "DM_NAME=${DM_NAME}"
     echo "USE_LVM=${USE_LVM}"

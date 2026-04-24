@@ -1,102 +1,98 @@
 # Azure Disk Encryption Migrate - Linux VM
 
-Migrates an Azure Linux VM with an encrypted (ADE) OS disk to a new unencrypted OS disk.
+Migrates an Azure Linux VM from an **ADE-encrypted OS disk** to a new **unencrypted OS disk**.
 
 Two modes:
 
-- **Replace (default)** — Deletes the source VM and recreates it with the same name, NIC, IP, and data disks, but with the unencrypted OS disk.
-- **Clone (`-Clone`)** — Creates a separate VM alongside the source. Source VM is not modified.
+- **Replace (default)** — recreates the source VM with the new unencrypted OS disk
+- **Clone (`-Clone`)** — creates a separate migrated VM and leaves the source VM untouched
+
+## Not supported
+
+- **ADE with encrypted data disks** (`VolumeType=All`, `VolumeType=Data`, or any VM where ADE reports encrypted data volumes)
+
+The PowerShell deployer checks this up front and stops before any migration work starts.
 
 ## Prerequisites
 
-- PowerShell 7+ with the `Az` module (`Az.Compute`, `Az.Network`, `Az.Resources`)
-- Azure account with permissions to create/delete VMs and disks
-- Source VM must be **running** (the encrypted disk must be unlocked)
+- PowerShell 7+ with the `Az` module (`Az.Compute`, `Az.Network`, `Az.Resources`) or,
+- Azure Cloud Shell
+- Azure permissions to create/delete VMs, disks, snapshots, NICs, and public IPs
+- Source VM must be **running** so the encrypted OS is already unlocked
 
 ## Quick Start
 
-Download the orchestrator script and run it — it will download the migration script automatically:
-
 ```powershell
 # Download
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/samatild/ade-disk-migrate/main/ade-deploy.ps1" -OutFile ade-deploy.ps1
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/samatild/ade-disk-migrate/main/az-linux-ade-migrate.ps1" -OutFile az-linux-ade-migrate.ps1
 
-# Run (replace source VM in-place)
-./ade-deploy.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM"
+# Replace the source VM in-place
+./az-linux-ade-migrate.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM"
 
-# Or clone instead (source VM untouched)
-./ade-deploy.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM" -Clone
+# Or create a separate migrated VM
+./az-linux-ade-migrate.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM" -Clone
 ```
 
-## Usage
+If you omit parameters, the script prompts interactively.
 
-### Automated (recommended)
+## How it works
 
-Run the orchestrator from your local machine or directly from Azure Cloud Shell:
+`az-linux-ade-migrate.ps1` is the Azure-side orchestrator. `az-linux-ade-migrate-guest.sh` runs inside the VM and performs the in-guest disk migration.
 
-```powershell
-# Replace source VM in-place
-./ade-deploy.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM"
+The automated flow is:
 
-# Clone instead (source VM untouched)
-./ade-deploy.ps1 -SubscriptionId "xxx" -ResourceGroupName "myRG" -VMName "myVM" -Clone
+1. Validate the VM and fail fast on unsupported ADE scope
+2. Create a recovery snapshot of the source OS disk
+3. Create and attach a blank target disk
+4. Upload and run `az-linux-ade-migrate-guest.sh` through Azure Run Command
+5. Inside the VM, copy the boot/EFI/root layout to the target disk, remove ADE/LUKS artifacts, regenerate initramfs/dracut, and rebuild GRUB
+6. Detach the migrated disk, create a managed OS disk from it, and either replace the source VM or create a clone
+
+At a high level, the on-VM script turns this:
+
+```text
+Encrypted source disk      Blank target disk
+┌────────────────────┐     ┌────────────────────┐
+│ BIOS / EFI / boot  │ --> │ BIOS / EFI / boot  │
+│ encrypted root/LVM │ --> │ plain root/LVM     │
+└────────────────────┘     └────────────────────┘
 ```
 
-If you omit parameters, you will be prompted interactively.
+## Manual mode
 
-The script handles everything: disk creation, migration, OS disk promotion, and VM creation.
-
-### Manual (on-VM only)
-
-If you prefer to run the migration script directly on the VM:
+If you want to run only the on-VM script yourself:
 
 ```bash
-# Upload
-scp ade-migrate.sh user@vm-ip:/tmp/
-
-# Preview
-sudo /tmp/ade-migrate.sh --dry-run
-
-# Run
-sudo /tmp/ade-migrate.sh --yes
+scp az-linux-ade-migrate-guest.sh user@vm-ip:/tmp/
+sudo /tmp/az-linux-ade-migrate-guest.sh --dry-run
+sudo /tmp/az-linux-ade-migrate-guest.sh --yes
 ```
 
-After the script completes, detach the data disk and create an OS disk from it manually.
-
-## What happens during migration
-
-1. A blank data disk is created and attached to the source VM
-2. The migration script (runs on-VM) copies the OS disk contents to the blank disk:
-
-```
-Encrypted OS Disk              Empty Target Disk
-┌─────────────────┐            ┌─────────────────┐
-│ BIOS boot (4MB) │  ──dd──►   │ BIOS boot (4MB) │
-│ EFI     (106MB) │  ─rsync─►  │ EFI     (106MB) │
-│ LUKS    (29.7G) │  ─rsync─►  │ ext4    (29.7G) │  ← decrypted!
-│ /boot   (256MB) │  ─rsync─►  │ /boot   (256MB) │
-└─────────────────┘            └─────────────────┘
-```
-   - Replicates the partition table (GPT)
-   - Copies BIOS boot, EFI, boot, and root partitions
-   - Writes root as plain ext4 (no encryption on target)
-   - Updates fstab, removes ADE/LUKS artifacts, regenerates initramfs, reinstalls GRUB
-3. The data disk is detached and promoted to a bootable OS disk
-4. A new VM is created from the OS disk
+After that, you must detach the migrated disk and create the new OS disk / VM yourself.
 
 ## Parameters
 
 | Parameter | Description |
 |-----------|-------------|
 | `-SubscriptionId` | Azure subscription ID |
-| `-ResourceGroupName` | Resource group of the source VM |
-| `-VMName` | Name of the source VM |
-| `-Clone` | Create a copy VM instead of replacing the source |
+| `-ResourceGroupName` | Resource group containing the source VM |
+| `-VMName` | Source VM name |
+| `-Clone` | Create a separate migrated VM instead of replacing the source |
 
+## Troubleshooting
 
-## Logs
+- On Source VM migration log: `/var/log/azmigrate-<timestamp>.log`
+- The deployer also prints the created snapshot, migrated disks, and target VM names at the end of a run
 
-On-VM migration logs are written to `/var/log/azmigrate-<timestamp>.log`.
+## Source Validation tests
+
+- **Gen1 (BIOS)**
+    - Ubuntu / Debian, raw layout
+
+- **Gen 2 (EFI)**
+    - Ubuntu / Debian, raw layout
+    - RHEL, LVM layout
+
 
 ## License
 
